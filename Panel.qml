@@ -1083,7 +1083,7 @@ Panel {
             PanelHero {
               id: hero
               width: parent.width
-              title: "OmaWindscribe"
+              title: "Windscribe"
               meta: root.heroMeta
               foreground: root.foreground
               fontFamily: root.fontFamily

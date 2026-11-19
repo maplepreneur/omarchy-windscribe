@@ -985,7 +985,7 @@ Item {
     Quickshell.execDetached(["busctl", "--user", "--", "call",
                              "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                              "org.freedesktop.Notifications", "Notify", "susssasa{sv}i",
-                             "OmaWindscribe", "0", notificationIconPath, summary, Model.escapeMarkup(body),
+                             "Windscribe", "0", notificationIconPath, summary, Model.escapeMarkup(body),
                              "0",
                              "2", "urgency", "y", level, "omarchy-glyph", "s", "\udb83\udf42",
                              "-1"])

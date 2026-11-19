@@ -2,7 +2,7 @@
 Thank you for taking the time, but this repository does not merge pull
 requests, and this one will be closed.
 
-OmaWindscribe is a VPN widget with a deliberate single-author policy. Public
+Windscribe is a VPN widget with a deliberate single-author policy. Public
 projects now receive a steady stream of AI-generated pull requests, some of
 them plausible-looking supply-chain attempts, and the only review process
 that reliably keeps that out of the code that opens your Windscribe password

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "io.github.maplepreneur.omarchy-windscribe",
-  "name": "OmaWindscribe",
+  "name": "Windscribe",
   "version": "1.0.0",
   "author": "maplepreneur",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "OmaWindscribe",
+    "displayName": "Windscribe",
     "description": "Toggle Windscribe, quick-connect, save named profiles in your theme's colours, pick a region or city, connect to your static IPs, and manage the firewall, split tunneling and Always On.",
     "category": "Network",
     "allowMultiple": false,

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for using OmaWindscribe. Feedback is very welcome, **exact code is not.**
+Thanks for using Windscribe. Feedback is very welcome, **exact code is not.**
 
 ## This repository has one managed author, on purpose
 

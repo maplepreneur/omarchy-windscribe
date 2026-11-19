@@ -1,6 +1,6 @@
-<img src="preview.png" width="420" alt="OmaWindscribe, a live world map, one click to connect, built for Omarchy">
+<img src="preview.png" width="420" alt="Windscribe, a live world map, one click to connect, built for Omarchy">
 
-# OmaWindscribe
+# Windscribe
 
 **Windscribe VPN, built for Omarchy.** All of Windscribe in one bar widget
 for [Omarchy](https://omarchy.org): a live world map of every city, one

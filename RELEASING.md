@@ -33,8 +33,8 @@ switches it.
 2. Merge to `main` and tag:
    ```bash
    git checkout main && git merge --no-ff staging && git push
-   git tag -a vX.Y.Z -m "OmaWindscribe X.Y.Z" && git push --tags
-   gh release create vX.Y.Z --title "OmaWindscribe X.Y.Z" --notes-file <notes>
+   git tag -a vX.Y.Z -m "Windscribe X.Y.Z" && git push --tags
+   gh release create vX.Y.Z --title "Windscribe X.Y.Z" --notes-file <notes>
    ```
 
 Users on `main` get the new code as soon as it's pushed, via

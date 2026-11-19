@@ -20,7 +20,7 @@ body:
     attributes:
       label: Versions
       description: "`omarchy version`, and the plugin version from `omarchy plugin list --json`"
-      placeholder: "Omarchy 4.x, OmaWindscribe 1.0.0, windscribe-cli 2.25.8"
+      placeholder: "Omarchy 4.x, Windscribe 1.0.0, windscribe-cli 2.25.8"
   - type: dropdown
     id: theme
     attributes:
