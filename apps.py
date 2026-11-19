@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """List installed apps as split-tunneling candidates, for the panel's picker.
 
-Proton matches split-tunnelled processes by executable path, with a prefix
-test that also covers a matched process's children. So the panel needs a real
-path on disk for every app it offers, not a desktop-entry name, and it must
-never offer a path that would sweep in far more than the app asked for.
+Windscribe matches split-tunnelled processes by executable path, with a
+prefix test that also covers a matched process's children. So the panel
+needs a real path on disk for every app it offers, not a desktop-entry
+name, and it must never offer a path that would sweep in far more than
+the app asked for.
 
 Desktop entries are the only list of "apps a person recognises" the system
 keeps, so they are the source here. Each entry's Exec line is reduced to its
