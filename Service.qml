@@ -504,7 +504,7 @@ Item {
     // A tunnel we didn't ask to close is the one thing a person must hear
     // about: the icon dimming is not a signal most people read.
     if (was && !parsed.connected && !_expectDown && !actionProcess.running && !connectProcess.running)
-      notify("VPN Disconnected 󰖂", "You're no longer protected.", "critical")
+      notify("VPN Disconnected 󰻌", "You're no longer protected.", "critical")
     _expectDown = false
     if (was !== parsed.connected) {
       trafficReset()
@@ -987,7 +987,7 @@ Item {
                              "org.freedesktop.Notifications", "Notify", "susssasa{sv}i",
                              "Windscribe", "0", notificationIconPath, summary, Model.escapeMarkup(body),
                              "0",
-                             "2", "urgency", "y", level, "omarchy-glyph", "s", "\udb83\udf42",
+                             "2", "urgency", "y", level, "omarchy-glyph", "s", "\udb81\udc98",
                              "-1"])
   }
 
@@ -1354,7 +1354,7 @@ Item {
           }
         }
         root.recordRecent(target)
-        root.notify("VPN Connected \udb80\udf3e", root.displayPlace || "Connected", "normal")
+        root.notify("VPN Connected \udb82\udd9d", root.displayPlace || "Connected", "normal")
       }
       // Look at the engine now rather than waiting for the poll, so the
       // override is released against fresh data as soon as possible.
