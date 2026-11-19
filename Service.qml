@@ -100,9 +100,12 @@ Item {
   // keys are edited here, but never from a cached copy of the file: every
   // save goes through the bundled confedit.py, which reads the file fresh
   // at the moment of the edit, changes exactly one key's line, writes
-  // atomically, and reads the key back so the rows can confirm what the
-  // engine actually has, never what we asked for. The FileView below only
-  // reads and watches.
+  // atomically, and checks the file's identity around the read, before
+  // the rename, and the whole file byte for byte after the write — an
+  // overlapping engine save is reconciled by re-applying the edit on top
+  // of the freshest content, never silently reverted, and the key is read
+  // back so the rows can confirm what the engine actually has, never what
+  // we asked for. The FileView below only reads and watches.
   readonly property string confPath:
     (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config"))
     + "/Windscribe/windscribe_cli.conf"
@@ -443,11 +446,12 @@ Item {
   // flow for Omarchy's helper), so the row hands the download+install
   // to the terminal rather than pretending it can click through.
   //
-  // One exact file, and the publisher's own hash checked before the
-  // privileged command. A wildcard here would install whatever else
-  // happens to match — a stale download, an unrelated package — so the
-  // instructions name the one file and verify it. Bump these two together
-  // when a new stable CLI release comes out.
+  // One exact file, and the publisher's own hash verified before — and
+  // gating — the privileged command: the checksum must print OK or the
+  // chain stops before pacman. A wildcard here would install whatever
+  // else happens to match — a stale download, an unrelated package — so
+  // the instructions name the one file and verify it. Bump these two
+  // together when a new stable CLI release comes out.
   readonly property string cliPackageVersion: "2.25.8"
   readonly property string cliPackage: "windscribe-cli_" + cliPackageVersion + "_amd64.pkg.tar.zst"
   readonly property string cliPackageSha256: "c469f7cff7b747076beecc6fa811ae7de515282af39e34fcda282729ee2919b3"
@@ -461,12 +465,10 @@ Item {
       "1. Download " + cliPackage + " — the standalone Arch x86_64 CLI package.\n" +
       "   The Linux section of windscribe.com/download links it, and Windscribe\n" +
       "   publishes the same file at github.com/Windscribe/Desktop-App (tag v" + cliPackageVersion + ").\n\n" +
-      "2. Check the published hash before anything privileged:\n" +
-      "   sha256sum ~/Downloads/" + cliPackage + "\n" +
-      "   expected: " + cliPackageSha256 + "\n" +
-      "   (the same SHA-256 Windscribe prints for this file in the release notes)\n\n" +
-      "3. Only if it matched, install that exact file — no wildcard:\n" +
-      "   sudo pacman -U ~/Downloads/" + cliPackage + "'"])
+      "2. Verify the download against the SHA-256 Windscribe publishes for\n" +
+      "   this file (CLI Installer Hashes in the release notes). The install\n" +
+      "   runs only if the checksum matches — one command, no wildcard:\n" +
+      "   cd ~/Downloads && echo \"" + cliPackageSha256 + "  " + cliPackage + "\" | sha256sum -c - && sudo pacman -U " + cliPackage + "'"])
     installWatch.restart()
   }
 

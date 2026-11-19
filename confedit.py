@@ -17,21 +17,29 @@ never saw. This helper closes both gaps as far as a non-Qt process can:
   * the file is never created: a missing file, section or key is refused
   * the write is atomic: a temp file in the same directory, fsynced, then
     renamed over the original with the original's permissions kept
-  * after writing, the key is read back from disk and compared with what
-    was asked for; the value actually on disk is printed to stdout either
-    way, so the caller can confirm what the engine has rather than assume
-    what it was sent
+  * an overlapping write is detected, never silently reverted: the file's
+    identity (inode, mtime, size) is checked around the read and again
+    immediately before the rename, and after the write the WHOLE file is
+    re-read and compared byte for byte with what was meant to land. Any
+    sign that another writer (the engine, most likely) touched the file in
+    that window makes the helper drop its snapshot, re-read the freshest
+    content, and re-apply its one-line edit on top of it, so the other
+    writer's setting -- a firewall or routing key, say -- always survives
+  * after the coordinated write, the key is read back from disk and
+    compared with what was asked for; the value actually on disk is
+    printed to stdout either way, so the caller can confirm what the
+    engine has rather than assume what it was sent
 
 Usage: confedit.py <file> <section> <key> <value>
 
 Exit codes:
-  0  written, and the key read back with exactly <value>
+  0  written, and the whole file verified to be exactly the intended edit
   3  file, section or key missing; nothing was written
   4  <value> cannot live on one INI line (contains a newline or NUL);
      nothing was written
-  5  written, but the key read back different: another writer (the engine,
-     most likely) replaced it between the write and the read-back; the
-     current on-disk value is printed
+  5  another writer kept replacing the file around the edit, so the asked
+     value could not be confirmed on disk; nothing was silently reverted,
+     and the current on-disk value is printed
   6  the file could not be read or written
 """
 import os
@@ -42,6 +50,11 @@ EXIT_MISSING = 3
 EXIT_REFUSED = 4
 EXIT_RACED = 5
 EXIT_IOERR = 6
+
+# How many times an edit is re-applied on top of fresher content before
+# the race is reported instead. Engine saves are user-paced; two or three
+# tries is far past any real burst.
+ATTEMPTS = 5
 
 
 def find_key(lines, section, key):
@@ -120,6 +133,15 @@ def atomic_write(path, text, mode):
         raise
 
 
+def identity(st):
+    """What makes a stat "the same file": inode plus content clock.
+
+    The engine saves through rename, so a save always lands on a new
+    inode; an in-place editor is still caught by mtime and size.
+    """
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
 def main(argv):
     if len(argv) != 5:
         print(__doc__.strip(), file=sys.stderr)
@@ -127,29 +149,53 @@ def main(argv):
     path, section, key, value = argv[1], argv[2], argv[3], argv[4]
     if "\n" in value or "\r" in value or "\x00" in value:
         return EXIT_REFUSED
+    for attempt in range(ATTEMPTS):
+        # Everything from here to the rename is this process's own
+        # runtime; a writer landing inside it is the race the loop
+        # reconciles, not a silent revert.
+        try:
+            before = os.stat(path)
+            lines = read_lines(path)
+            after_read = os.stat(path)
+        except FileNotFoundError:
+            return EXIT_MISSING
+        except OSError:
+            return EXIT_IOERR
+        if identity(after_read) != identity(before):
+            continue  # written during the read: don't trust the copy
+        at = find_key(lines, section, key)
+        if at is None:
+            return EXIT_MISSING
+        lines[at] = rewrite_line(lines[at], key, value)
+        text = "\n".join(lines)
+        try:
+            if identity(os.stat(path)) != identity(before):
+                continue  # fresher content exists: re-read, don't clobber
+            atomic_write(path, text, before.st_mode & 0o7777)
+            landed_lines = read_lines(path)
+        except FileNotFoundError:
+            return EXIT_MISSING
+        except OSError:
+            return EXIT_IOERR
+        # Verify the whole file, not just our key: if a writer landed
+        # during the rename, our snapshot reverted its change, and the
+        # fix is to re-apply ours on top of what is there now.
+        if "\n".join(landed_lines) != text:
+            continue
+        print(value_of(landed_lines, section, key))
+        return 0
+    # Another writer kept winning the file through every attempt. Its
+    # content is what stands (nothing of ours is left to revert it), so
+    # report the race and the value actually there instead of claiming
+    # the save.
     try:
         lines = read_lines(path)
-    except FileNotFoundError:
-        return EXIT_MISSING
     except OSError:
         return EXIT_IOERR
-    at = find_key(lines, section, key)
-    if at is None:
-        return EXIT_MISSING
-    lines[at] = rewrite_line(lines[at], key, value)
-    try:
-        atomic_write(path, "\n".join(lines), os.stat(path).st_mode & 0o7777)
-    except OSError:
-        return EXIT_IOERR
-    # Confirm against what is actually on disk, not what we sent: the
-    # engine may have saved over the file in the same instant.
-    try:
-        landed = value_of(read_lines(path), section, key)
-    except OSError:
-        return EXIT_IOERR
+    landed = value_of(lines, section, key)
     if landed is not None:
         print(landed)
-    return 0 if landed == value else EXIT_RACED
+    return EXIT_RACED
 
 
 if __name__ == "__main__":

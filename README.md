@@ -86,13 +86,19 @@ back and click the Windscribe mark. Sign-in happens in the panel.
   Check it against the SHA-256 Windscribe prints in that release's notes
   ("CLI Installer Hashes") before the privileged install — never
   `pacman -U` a wildcard, which would install a stale or unrelated
-  matching file just as happily:
+  matching file just as happily — and gate the install on the check, so
+  the privileged command never runs against a mismatched download:
 
   ```bash
-  sha256sum ~/Downloads/windscribe-cli_2.25.8_amd64.pkg.tar.zst
-  # expected: c469f7cff7b747076beecc6fa811ae7de515282af39e34fcda282729ee2919b3
-  sudo pacman -U ~/Downloads/windscribe-cli_2.25.8_amd64.pkg.tar.zst
+  cd ~/Downloads
+  echo 'c469f7cff7b747076beecc6fa811ae7de515282af39e34fcda282729ee2919b3  windscribe-cli_2.25.8_amd64.pkg.tar.zst' \
+    | sha256sum -c - \
+    && sudo pacman -U windscribe-cli_2.25.8_amd64.pkg.tar.zst
   ```
+
+  `sha256sum -c` prints `OK` and only then does `pacman` run; a mismatch
+  prints `FAILED`/`WARNING` and stops the chain before anything
+  privileged.
 
   The CLI needs `nftables` and a few base packages (the package manager
   resolves them) and enables a `windscribe-helper` system service plus a
@@ -111,9 +117,10 @@ rest:
 
 1. **Install the Windscribe CLI** if it isn't there: the row opens a
    terminal with the exact steps — one named package file, its published
-   SHA-256 checked before anything privileged, and `sudo pacman -U` on
-   that exact file alone. The install itself needs your password, since
-   it's a system package.
+   SHA-256 verified before anything privileged (the install command runs
+   only if the checksum matches), and `sudo pacman -U` on that exact file
+   alone. The install itself needs your password, since it's a system
+   package.
 2. **Sign in**: type your Windscribe username or email in the panel and
    press Enter. A terminal opens for your password and 2FA code, then
    closes.
@@ -555,15 +562,20 @@ practice:
   written on start-up, on a poll, or when you connect.
 - The helper reads the file from disk at the moment of the edit, so a
   newer change the engine just saved can't be reverted by a stale copy.
-  The read-modify-write window is the helper's own few milliseconds, not
-  the age of a cache.
+  An overlapping write is caught, not clobbered: the file's identity is
+  checked around the read and before the rename, the whole file is
+  re-read and compared after it, and on any sign of a race the helper
+  re-reads the freshest content and re-applies its one-line edit on top —
+  so a firewall or routing setting the engine saved in the same instant
+  always survives, never gets silently reverted.
 - The edit is surgical and per-setting: exactly one `Key=value` line
   changes, and every other byte of the file — section order, unknown
   keys, spacing — comes back exactly as found. A diff before and after a
   change shows the one line and nothing else, not even an extra
   newline.
-- After writing, the helper reads the key back, so the rows confirm the
-  value the engine actually has. If the engine replaced the value in the
+- After writing, the helper verifies the whole file is exactly the
+  intended edit and reads the key back, so the rows confirm the value
+  the engine actually has. If the engine kept replacing the value in the
   same instant, the row says so rather than pretending the click took.
 - If the file, section or key is missing, nothing is written and the row
   says Windscribe hasn't written its settings yet. The widget never

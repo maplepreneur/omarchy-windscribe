@@ -34,10 +34,15 @@ section:
   you flip a switch the CLI has no command for. Those writes go through
   one bundled helper (confedit.py) that reads the file fresh at the
   moment of the edit, changes one line (every other byte comes back as
-  found), writes atomically, and reads the key back to confirm what
-  landed. They never happen on a timer, never while a CLI action is
-  running, and the app list is encoded with Qt's own string-list rules
-  so a path with a comma stays one entry.
+  found), and writes atomically. An overlapping engine write is detected
+  — the file's identity is checked around the read and before the
+  rename, and the whole file is compared after it — and reconciled by
+  re-applying the edit on top of the freshest content, so another
+  setting's save is never silently reverted; a race that won't settle is
+  reported, with the on-disk value read back, rather than claimed. They
+  never happen on a timer, never while a CLI action is running, and the
+  app list is encoded with Qt's own string-list rules so a path with a
+  comma stays one entry.
 - It never asks for root, and it never executes downloaded content.
 
 If you can read QML, the whole widget is a handful of small files; the

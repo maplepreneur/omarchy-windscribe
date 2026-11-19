@@ -55,3 +55,10 @@ status or location list, this reproduces it without touching the panel:
 ```bash
 node tests/model-test.mjs
 ```
+
+The settings helper's coordination guarantees (including its handling of
+an overlapping engine write) have their own focused suite:
+
+```bash
+python3 tests/confedit-test.py
+```
