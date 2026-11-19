@@ -31,9 +31,13 @@ section:
 - It writes two files of its own under
   `~/.local/state/omarchy-windscribe/`, and one file that isn't its own —
   Windscribe's `~/.config/Windscribe/windscribe_cli.conf` — and only when
-  you flip a switch the CLI has no command for. Those writes are surgical
-  (one line changes, every other byte comes back as found), atomic, and
-  never happen on a timer.
+  you flip a switch the CLI has no command for. Those writes go through
+  one bundled helper (confedit.py) that reads the file fresh at the
+  moment of the edit, changes one line (every other byte comes back as
+  found), writes atomically, and reads the key back to confirm what
+  landed. They never happen on a timer, never while a CLI action is
+  running, and the app list is encoded with Qt's own string-list rules
+  so a path with a comma stays one entry.
 - It never asks for root, and it never executes downloaded content.
 
 If you can read QML, the whole widget is a handful of small files; the

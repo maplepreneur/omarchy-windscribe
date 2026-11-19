@@ -324,6 +324,9 @@ Panel {
   readonly property string heroMeta: {
     if (!vpn.installed) return vpn.installing ? "Installing…" : "Not installed"
     if (vpn.busy && vpn.pendingLabel !== "") return vpn.pendingLabel
+    // The engine isn't answering: unknown, not a protection claim either
+    // way (the bar icon dims with it).
+    if (vpn.statusStale) return "Status unknown"
     if (vpn.connected) {
       var meta = vpn.displayPlace === "" ? "Protected" : vpn.displayPlace
       // Through a profile, the name you gave the place leads.
@@ -946,6 +949,7 @@ Panel {
         autoReady: vpn.autoReady,
         autoLastError: vpn.autoLastError,
         statusConnected: vpn.statusConnected,
+        statusStale: vpn.statusStale,
         desired: vpn._desired,
         autoWaitMs: Math.max(0, vpn._autoNextMs - Date.now()),
         pinFailed: vpn._autoPinFailed,
@@ -1434,6 +1438,8 @@ Panel {
                 width: parent.width
                 label: "Always-on firewall"
                 description: {
+                  var raced = vpn.confRacedNote("FirewallMode")
+                  if (raced !== "") return raced
                   if (!vpn.confLoaded) return "Loading…"
                   if (!vpn.splitAvailable) return "Windscribe hasn't written its settings yet"
                   if (vpn.firewallAlwaysOn) return "Never goes down, even when disconnected"
@@ -1541,8 +1547,12 @@ Panel {
               Toggle {
                 width: parent.width
                 label: "Allow LAN traffic"
-                description: vpn.lanTrafficOn ? "Local devices reachable while on the VPN"
-                                               : "Local devices are blocked while the firewall is on"
+                description: {
+                  var raced = vpn.confRacedNote("AllowLANTraffic")
+                  if (raced !== "") return raced
+                  return vpn.lanTrafficOn ? "Local devices reachable while on the VPN"
+                                          : "Local devices are blocked while the firewall is on"
+                }
                 checked: vpn.lanTrafficOn
                 enabled: vpn.splitAvailable && !vpn.busy
                 hasCursor: root.cursorActive && root.focusSection === "protection" && root.protectionIndex === root.lanIndex

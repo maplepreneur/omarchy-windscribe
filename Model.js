@@ -297,10 +297,12 @@ function shellQuote(text) {
 // ~/.config/Windscribe/windscribe_cli.conf is an INI file the engine
 // watches and applies "as soon as the file is saved" (its own help text).
 // The CLI itself has no commands for split tunneling, LAN traffic or the
-// always-on firewall mode, so the widget edits those keys here. The rules
-// are the same ones OmaProton follows with Proton's settings.json: read it
-// fresh, change one key's value, hand every other byte back exactly as
-// found, and never create the file.
+// always-on firewall mode, so the widget edits those keys itself. The
+// writing is done by the bundled confedit.py: it reads the file fresh at
+// the moment of the edit (the engine rewrites the same file, so a cached
+// copy could revert a newer change), changes exactly one key's line, and
+// reads the key back to confirm what actually landed. What remains here
+// is the reading side, and the string-list encoding for the app list.
 
 // The whole parsed [section] -> { key: value }, or null when the section
 // isn't there. A key with no value ("Key=") is an empty string, which is
@@ -330,41 +332,184 @@ function parseConfSection(raw, section) {
   return found ? out : null
 }
 
-// Rewrite one key's value in one section, changing nothing else: every
-// line outside that key is handed back byte-identical, including section
-// order, unknown keys, blank lines and spacing. Returns "" when the key
-// or section isn't there, because inventing a home for a setting the
-// engine didn't write is guessing, not editing.
-function setConfValue(raw, section, key, value) {
-  var lines = String(raw || "").split("\n")
-  var inSection = false
-  var done = false
-  var out = []
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i]
-    var trimmed = line.trim()
-    if (trimmed.charAt(0) === "[") {
-      if (inSection && !done) { inSection = false; break }
-      inSection = trimmed === "[" + section + "]"
-      out.push(line)
+// ── QSettings-compatible string lists ───────────────────────────────────
+//
+// The engine is a Qt app, and the app list is stored as a QSettings INI
+// string list. Qt's rules are not "split on commas": an element is
+// escaped (C-style for quotes, backslashes and control characters) and
+// quoted in double quotes when it contains `;`, `,` or `=`, or leads or
+// trails with a space; the elements are joined with ", "; reading
+// splits on commas outside quotes, honours the escapes, skips spaces
+// after each comma, and chops trailing spaces from unquoted elements.
+// A path with a comma in it is one entry, not two.
+//
+// Both functions below are ports of Qt's iniEscapedStringList /
+// iniUnescapedStringList (qsettings.cpp), kept close enough that
+// anything this widget writes reads back identically in the engine and
+// anything the engine writes reads back identically here.
+
+// Qt's iniEscapedString: one element, escaped and quoted when needed.
+function encodeIniString(str) {
+  var s = String(str)
+  var out = ""
+  var quoted = s.indexOf(";") !== -1 || s.indexOf(",") !== -1 || s.indexOf("=") !== -1
+  var escapeNextIfDigit = false
+  for (var i = 0; i < s.length; i++) {
+    var code = s.charCodeAt(i)
+    var ch = s.charAt(i)
+    // A hex escape followed by a hex digit would be read as one longer
+    // escape, so the digit gets its own. Qt does the same, which is
+    // what makes the pair round-trip.
+    if (escapeNextIfDigit && /[0-9a-fA-F]/.test(ch)) {
+      out += "\\x" + code.toString(16)
       continue
     }
-    if (inSection && !done) {
-      var eq = trimmed.indexOf("=")
-      var name = eq > 0 ? trimmed.substring(0, eq).trim() : ""
-      if (name === key) {
-        var indent = line.substring(0, line.indexOf(name)) // keep left padding
-        out.push((indent || "") + key + "=" + String(value))
-        done = true
-        continue
-      }
+    escapeNextIfDigit = false
+    switch (ch) {
+      case "\u0000": out += "\\0"; escapeNextIfDigit = true; break
+      case "\u0007": out += "\\a"; break
+      case "\u0008": out += "\\b"; break
+      case "\u000c": out += "\\f"; break
+      case "\u000a": out += "\\n"; break
+      case "\u000d": out += "\\r"; break
+      case "\u0009": out += "\\t"; break
+      case "\u000b": out += "\\v"; break
+      case '"': out += '\\"'; break
+      case "\\": out += "\\\\"; break
+      default:
+        if (code <= 0x1F || code === 0x7F) {
+          out += "\\x" + code.toString(16)
+          escapeNextIfDigit = true
+        } else {
+          out += ch
+        }
     }
-    out.push(line)
   }
-  if (!done) return ""
-  // Keep the file's own trailing-newline habit: a file that ended with a
-  // newline still does, one that didn't still doesn't.
-  var text = out.join("\n")
-  if (/[\r\n]$/.test(String(raw || ""))) text += "\n"
-  return text
+  if (quoted || (out.length > 0 && (out.charAt(0) === " " || out.charAt(out.length - 1) === " ")))
+    out = '"' + out + '"'
+  return out
+}
+
+// Qt's iniEscapedStringList, with one deliberate difference: Qt writes an
+// empty list as "@Invalid()"; this widget writes an empty value, which is
+// what the engine itself leaves in a fresh settings file and what this
+// widget has always written for "no apps chosen", so an empty selection
+// never changes representation under the engine.
+function encodeIniStringList(arr) {
+  var src = (arr && typeof arr.length === "number") ? arr : []
+  var out = []
+  for (var i = 0; i < src.length; i++) out.push(encodeIniString(src[i]))
+  return out.join(", ")
+}
+
+// Qt's iniUnescapedStringList: the value of one INI key as the engine
+// itself would split it. With no unquoted comma the whole value is one
+// element, exactly as Qt returns it as a plain string.
+function parseIniStringList(raw) {
+  var str = String(raw || "")
+  var list = null            // null until the first unquoted comma
+  var cur = ""
+  var inQuotes = false
+  var quoted = false         // the current element had a quote: keep its spaces
+  var chop = 0               // spaces after this point are trailing, and go
+  var i = 0
+  var n = str.length
+  var state = 0              // 0 normal, 1 hex escape, 2 octal escape
+  var escapeVal = 0
+  var done = false
+  var skipFinalChop = false  // Qt jumps past the final chop from its escape states
+
+  var SINGLE = { a: "\u0007", b: "\u0008", f: "\u000c", n: "\u000a",
+                r: "\u000d", t: "\u0009", v: "\u000b",
+                '"': '"', "?": "?", "'": "'", "\\": "\\" }
+  function hexVal(c) { return /[0-9a-fA-F]/.test(c) ? parseInt(c, 16) : -1 }
+  function octVal(c) { return c >= "0" && c <= "7" ? c.charCodeAt(0) - 48 : -1 }
+  function skipSpaces() {
+    while (i < n && (str.charAt(i) === " " || str.charAt(i) === "\t")) i++
+  }
+  function chopSpaces() {
+    while (cur.length - 1 >= chop && (cur.charAt(cur.length - 1) === " " || cur.charAt(cur.length - 1) === "\t"))
+      cur = cur.slice(0, cur.length - 1)
+  }
+
+  skipSpaces()
+  while (!done) {
+    if (state === 0) {
+      chop = cur.length
+      while (i < n) {
+        var c = str.charAt(i)
+        if (c === "\\") {
+          i++
+          if (i >= n) { done = true; skipFinalChop = true; break }
+          var e = str.charAt(i)
+          i++
+          if (SINGLE[e] !== undefined) { cur += SINGLE[e]; chop = cur.length; continue }
+          if (e === "x") {
+            escapeVal = 0
+            if (i >= n) { done = true; skipFinalChop = true; break }
+            if (hexVal(str.charAt(i)) !== -1) { state = 1; break }
+            // "\x" then something else: both are dropped, the something
+            // else is not consumed.
+            chop = cur.length
+            continue
+          }
+          var o = octVal(e)
+          if (o !== -1) { escapeVal = o; state = 2; break }
+          if (e === "\n" || e === "\r") {
+            // A line-continuation pair, not content.
+            if (i < n) {
+              var c2 = str.charAt(i)
+              if ((c2 === "\n" || c2 === "\r") && c2 !== e) i++
+            }
+          }
+          // An escape Qt doesn't recognise: the backslash and the
+          // character after it are both dropped.
+          chop = cur.length
+          continue
+        }
+        if (c === '"') {
+          i++
+          quoted = true
+          inQuotes = !inQuotes
+          if (!inQuotes) { skipSpaces(); chop = cur.length }
+          continue
+        }
+        if (c === "," && !inQuotes) {
+          if (!quoted) chopSpaces()
+          if (list === null) list = []
+          list.push(cur)
+          cur = ""
+          quoted = false
+          i++
+          skipSpaces()
+          chop = cur.length
+          continue
+        }
+        cur += c
+        i++
+      }
+      if (i >= n) {
+        done = true
+        if (!skipFinalChop && !quoted) chopSpaces()
+      }
+      continue
+    }
+    if (state === 1) {
+      if (i >= n) { cur += String.fromCharCode(escapeVal); done = true; skipFinalChop = true; continue }
+      var h = hexVal(str.charAt(i))
+      if (h !== -1) { escapeVal = (escapeVal << 4) + h; i++; continue }
+      cur += String.fromCharCode(escapeVal)
+      state = 0
+      continue
+    }
+    // state === 2
+    if (i >= n) { cur += String.fromCharCode(escapeVal); done = true; skipFinalChop = true; continue }
+    var ov = octVal(str.charAt(i))
+    if (ov !== -1) { escapeVal = (escapeVal << 3) + ov; i++; continue }
+    cur += String.fromCharCode(escapeVal)
+    state = 0
+  }
+  if (list === null) return [cur]
+  list.push(cur)
+  return list
 }

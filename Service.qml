@@ -94,19 +94,31 @@ Item {
 
   // ── Windscribe's preferences file ────────────────────────────────────
   // ~/.config/Windscribe/windscribe_cli.conf is an INI file the engine
-  // watches and applies "as soon as the file is saved". The CLI has no
-  // command for split tunneling, LAN traffic or the always-on firewall
-  // mode, so those keys are edited here, with the same discipline
-  // OmaProton applies to Proton's settings.json: read it fresh, change
-  // one value, hand every other byte back exactly as found, and never
-  // create the file.
+  // watches and applies "as soon as the file is saved" — and rewrites
+  // itself whenever its own state changes. The CLI has no command for
+  // split tunneling, LAN traffic or the always-on firewall mode, so those
+  // keys are edited here, but never from a cached copy of the file: every
+  // save goes through the bundled confedit.py, which reads the file fresh
+  // at the moment of the edit, changes exactly one key's line, writes
+  // atomically, and reads the key back so the rows can confirm what the
+  // engine actually has, never what we asked for. The FileView below only
+  // reads and watches.
   readonly property string confPath:
     (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config"))
     + "/Windscribe/windscribe_cli.conf"
+  readonly property string confEditScriptPath: Qt.resolvedUrl("confedit.py").toString().replace(/^file:\/\//, "")
   property var confConnection: null      // parsed [Connection] or null
   property bool confLoaded: false
   property bool confMissing: false
   property bool confError: false
+  // The key whose last save was written but replaced on disk again before
+  // the read-back: its row says so, because a switch that doesn't take
+  // needs an explanation.
+  property string confRacedKey: ""
+  // The save the helper is running, and the one queued behind it: a
+  // burst of saves (ticking several apps in) lands the last of them.
+  property var confWriting: null        // {key, value} in flight
+  property var confQueued: null         // {key, value} waiting
 
   readonly property bool splitAvailable: confLoaded && confConnection !== null
   readonly property bool splitOn: splitAvailable && String(confConnection["SplitTunnelingEnabled"] || "false") === "true"
@@ -114,13 +126,17 @@ Item {
     var m = String((confConnection || {})["SplitTunnelingMode"] || "Exclude")
     return m === "Include" ? "Include" : "Exclude"
   }
+  // The engine is a Qt app and stores this as a QSettings string list,
+  // so it is decoded with Qt's own rules — quotes, escapes, and commas
+  // outside quotes — never a bare split(","): a path with a comma in it
+  // is one entry, exactly as the engine reads it.
   readonly property var splitApps: {
     var raw = String((confConnection || {})["SplitTunnelingApps"] || "")
     var out = []
     var seen = ({})
-    var parts = raw.split(",")
+    var parts = Model.parseIniStringList(raw)
     for (var i = 0; i < parts.length; i++) {
-      var p = parts[i].trim()
+      var p = parts[i]
       if (p.charAt(0) !== "/" || seen[p]) continue
       seen[p] = true
       out.push(p)
@@ -143,24 +159,30 @@ Item {
     "SplitTunnelingMode": ["Exclude", "Include"]
   })
 
+  function startConfEdit(key, value) {
+    if (confProcess.running) return false
+    confWriting = { key: key, value: value }
+    confProcess.command = ["python3", confEditScriptPath, confPath, "Connection", key, value]
+    confProcess.running = true
+    return true
+  }
+
+  // One guarded door for every write to Windscribe's file, whatever the
+  // key. The engine saves when its own state changes, so a save never
+  // crosses one of our own CLI actions, and never overlaps another save:
+  // a second request queues behind the one in flight, and the last one
+  // wins.
+  function requestConfEdit(key, value) {
+    if (actionProcess.running || connectProcess.running) return false
+    if (confProcess.running) { confQueued = { key: key, value: value }; return true }
+    return startConfEdit(key, value)
+  }
+
   function writeConf(key, value) {
     if (!splitAvailable) return false
     var allowed = confValues[key]
     if (!allowed || allowed.indexOf(value) === -1) return false
-    // The engine rewrites this file itself, so never write across one of
-    // our own actions; a CLI run that changes settings and a save here
-    // would race on the same file.
-    if (actionProcess.running || connectProcess.running) return false
-    var raw = confFile.text()
-    var next = Model.setConfValue(raw, "Connection", key, value)
-    if (next === "") { confError = true; return false }
-    confError = false
-    // Read-modify-write against the text we just parsed, not a re-parse:
-    // the engine may have saved between the parse and now, and losing
-    // that change would be worse than waiting for the next read. The
-    // FileView watcher re-reads whatever lands on disk anyway.
-    confFile.setText(next)
-    return true
+    return requestConfEdit(key, value)
   }
 
   function toggleSplitTunnel() { writeConf("SplitTunnelingEnabled", splitOn ? "false" : "true") }
@@ -171,8 +193,10 @@ Item {
   }
   // The panel hands back the full selection rather than one add or remove,
   // which is what MultiSelect emits and what the conf stores anyway.
-  // Paths are only ever accepted from the installed-app scan, so a path
-  // that isn't absolute never reaches the file.
+  // Paths only ever come from the installed-app scan, and the value is
+  // encoded with Qt's own string-list rules (Model.encodeIniStringList),
+  // so a path containing a comma or a quote stays one entry instead of
+  // becoming several under the engine's parser.
   function setSplitApps(paths) {
     if (!splitAvailable) return
     var clean = []
@@ -180,22 +204,32 @@ Item {
     var arr = (paths && typeof paths.length === "number") ? paths : []
     for (var i = 0; i < arr.length; i++) {
       var p = String(arr[i])
-      if (p.charAt(0) !== "/" || p.indexOf("\u0000") !== -1) continue
+      if (p.charAt(0) !== "/" || p.indexOf("\u0000") !== -1 || p.indexOf("\n") !== -1) continue
       if (seen[p]) continue
       seen[p] = true
       clean.push(p)
     }
-    var raw = confFile.text()
-    var next = Model.setConfValue(raw, "Connection", "SplitTunnelingApps", clean.join(","))
-    if (next !== "") confFile.setText(next)
+    requestConfEdit("SplitTunnelingApps", Model.encodeIniStringList(clean))
   }
   function toggleLanTraffic() { writeConf("AllowLANTraffic", lanTrafficOn ? "false" : "true") }
   function toggleAlwaysOnFirewall() { writeConf("FirewallMode", firewallAlwaysOn ? "Auto" : "Always On") }
 
+  // What a row says when its save landed but was replaced again before
+  // the read-back: the file, not the request, is what its switch shows.
+  function confRacedNote(key) {
+    return confRacedKey === key
+      ? "Saved, but Windscribe changed it again — showing its current value"
+      : ""
+  }
+
   function splitDescription() {
     if (!confLoaded) return "Loading…"
     if (!splitAvailable) return "Windscribe hasn't written its settings yet"
-    if (confError) return "Could not read Windscribe's settings"
+    if (confError) return "Could not change Windscribe's settings"
+    var raced = confRacedNote("SplitTunnelingEnabled")
+    if (raced !== "") return raced
+    raced = confRacedNote("SplitTunnelingApps")
+    if (raced !== "") return raced
     if (!splitOn) return "Keep chosen apps off the VPN"
     var n = splitApps.length
     if (n === 0) return "No apps chosen yet"
@@ -337,10 +371,16 @@ Item {
   function probeStalled(exitCode) { return exitCode === 124 || exitCode === 137 }
 
   // Consecutive status failures. One is a blip and is retried on the next
-  // poll. Three in a row means the engine isn't answering, so the panel
-  // says so rather than pretending nothing is known.
+  // poll. Three in a row means the engine isn't answering, so everything
+  // the last answer claimed is expired — the protection indication above
+  // all — and the panel says unknown rather than pretending anything is
+  // still known.
   property int _statusFailures: 0
   readonly property int statusGiveUpAfter: 3
+  // True while the last status answer is too old to trust: no poll has
+  // confirmed anything since. The bar drops its protected look and the
+  // panel reads unknown until a fresh answer lands.
+  readonly property bool statusStale: _statusFailures >= statusGiveUpAfter
 
   readonly property int watchIntervalSec: intSetting("watchIntervalSec", 4, 2, 60)
   readonly property bool notificationsOn: String(setting("notifications", "on")) !== "off"
@@ -356,6 +396,10 @@ Item {
   readonly property string displayStatus: {
     if (!installed) return "Not installed"
     if (busy && pendingLabel !== "") return pendingLabel
+    // Unknown, not "Not protected": an engine that isn't answering could
+    // have a tunnel up that we can't see, and claiming either direction
+    // is a claim the data doesn't support.
+    if (statusStale) return "Status unknown"
     if (connected) return "Protected"
     if (statusConnecting) return "Connecting…"
     if (!accountProbed) return "Checking…"
@@ -398,12 +442,31 @@ Item {
   // local package (windscribe-cli isn't in the repos or AUR's normal
   // flow for Omarchy's helper), so the row hands the download+install
   // to the terminal rather than pretending it can click through.
+  //
+  // One exact file, and the publisher's own hash checked before the
+  // privileged command. A wildcard here would install whatever else
+  // happens to match — a stale download, an unrelated package — so the
+  // instructions name the one file and verify it. Bump these two together
+  // when a new stable CLI release comes out.
+  readonly property string cliPackageVersion: "2.25.8"
+  readonly property string cliPackage: "windscribe-cli_" + cliPackageVersion + "_amd64.pkg.tar.zst"
+  readonly property string cliPackageSha256: "c469f7cff7b747076beecc6fa811ae7de515282af39e34fcda282729ee2919b3"
+
   function installCli() {
     if (installed || installing) return
     installing = true
     lastError = ""
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
-      "echo 'Install the Windscribe CLI: download windscribe-cli_*_amd64.pkg.tar.zst from windscribe.com/download (Linux), then: sudo pacman -U ~/Downloads/windscribe-cli_*_amd64.pkg.tar.zst'"])
+      "echo 'Install the Windscribe CLI:\n\n" +
+      "1. Download " + cliPackage + " — the standalone Arch x86_64 CLI package.\n" +
+      "   The Linux section of windscribe.com/download links it, and Windscribe\n" +
+      "   publishes the same file at github.com/Windscribe/Desktop-App (tag v" + cliPackageVersion + ").\n\n" +
+      "2. Check the published hash before anything privileged:\n" +
+      "   sha256sum ~/Downloads/" + cliPackage + "\n" +
+      "   expected: " + cliPackageSha256 + "\n" +
+      "   (the same SHA-256 Windscribe prints for this file in the release notes)\n\n" +
+      "3. Only if it matched, install that exact file — no wildcard:\n" +
+      "   sudo pacman -U ~/Downloads/" + cliPackage + "'"])
     installWatch.restart()
   }
 
@@ -461,6 +524,42 @@ Item {
     updateAvailable = parsed.update
     fields = parsed.fields
     reconcile()
+  }
+
+  // The last answer's claims are only trustworthy while they're fresh.
+  // When the engine stops answering, every claim that answer made is
+  // dropped — the protection indication above all, so the bar can't keep
+  // its protected colour on data that old — and the honest state is
+  // unknown, not protected and not unprotected. The login state is kept:
+  // an engine that isn't answering says nothing about the session, and
+  // dropping it would pop a sign-in prompt over a session that may be
+  // fine. A fresh poll repopulates all of it.
+  //
+  // The optimistic override (_desired) is released only when nothing is
+  // in flight: a connect that is still running keeps its own story, and
+  // its own timeout.
+  function expireStatus() {
+    statusConnected = false
+    statusConnecting = false
+    statusDisconnecting = false
+    checkingConnection = false
+    interference = false
+    currentWhere = ""
+    currentCity = ""
+    currentNickname = ""
+    currentPlace = null
+    protocolLine = ""
+    ipLine = ""
+    firewallState = ""
+    dataUsage = ""
+    updateAvailable = ""
+    fields = []
+    statusText = ""
+    trafficReset()
+    if (!busy && _desired !== -1) {
+      _desired = -1
+      pendingLabel = ""
+    }
   }
 
   // Drop the optimistic override as soon as the world agrees with it, and
@@ -1074,18 +1173,18 @@ Item {
     onLoadFailed: if (!root.stateLoaded) root.applyState("{}")
   }
 
-  // Windscribe's file, not ours. Watched rather than polled, because the
-  // engine rewrites it from its own GUI and the panel would otherwise
-  // show a stale copy of a file that just changed underneath it.
+  // Windscribe's file, not ours. Read and watched only: every write goes
+  // through confedit.py, so the panel always shows what the engine's file
+  // actually holds — including the read-back of our own saves. The watch
+  // (rather than a poll) is what keeps a save made from Windscribe's own
+  // GUI visible here within a moment.
   FileView {
     id: confFile
     path: root.confPath
     printErrors: false
     watchChanges: true
-    atomicWrites: true
     onLoaded: {
       root.confMissing = false
-      root.confError = false
       root.confConnection = Model.parseConfSection(text(), "Connection")
       root.confLoaded = true
     }
@@ -1093,7 +1192,43 @@ Item {
     // No file yet means Windscribe hasn't run here; the split row says so
     // rather than offering a switch that would have to create one.
     onLoadFailed: { root.confMissing = true; root.confConnection = null; root.confLoaded = true }
-    onSaveFailed: root.confError = true
+  }
+
+  // One save at a time. requestConfEdit() queues the last request behind
+  // the one in flight; this handler drains the queue when it lands.
+  Process {
+    id: confProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: confStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var wrote = root.confWriting
+      root.confWriting = null
+      // 0 = written, and the key read back with exactly the value asked
+      // for. 5 = written, but another writer replaced the key before the
+      // read-back, so the rows show the file, not the request. Anything
+      // else = nothing was written: a missing file, section or key (3),
+      // a value that can't live on one INI line (4), or the file
+      // unreadable (6).
+      if (exitCode === 0) {
+        root.confError = false
+        root.confRacedKey = ""
+      } else if (exitCode === 5 && wrote) {
+        root.confError = false
+        root.confRacedKey = wrote.key
+      } else {
+        root.confError = true
+      }
+      // Whatever landed, re-read the watched file: the rows confirm the
+      // value the engine has, never the one we asked for.
+      confFile.reload()
+      var next = root.confQueued
+      root.confQueued = null
+      // A queued save only runs if no CLI action started meanwhile; one
+      // that did is dropped rather than written across it.
+      if (next && !root.actionProcess.running && !root.connectProcess.running)
+        root.startConfEdit(next.key, next.value)
+    }
   }
 
   Timer {
@@ -1191,10 +1326,19 @@ Item {
       }
       root._statusFailures += 1
       if (root._statusFailures >= root.statusGiveUpAfter) {
+        var wasConnected = root.statusConnected
         root.accountProbed = true
+        // The answer is too old to trust: expire every claim it made,
+        // first of all the protected colour on the bar, until a fresh
+        // poll confirms the tunnel again.
+        root.expireStatus()
         root.lastError = root.probeStalled(exitCode)
           ? "Windscribe isn't answering. Is the windscribe service running?"
           : Model.elide(err || "windscribe-cli status failed")
+        // Once, on the crossing failure, and only if the bar was claiming
+        // protection: losing that claim is the thing a person must hear.
+        if (wasConnected && root._statusFailures === root.statusGiveUpAfter)
+          root.notify("VPN Status Unknown 󰻌", "Windscribe stopped answering; can't confirm the tunnel.", "low")
       }
     }
   }

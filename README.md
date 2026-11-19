@@ -77,12 +77,26 @@ back and click the Windscribe mark. Sign-in happens in the panel.
 - A Windscribe account, a free one works; sign up at
   [windscribe.com](https://windscribe.com)
 - The Windscribe CLI, installed as `windscribe-cli` — the panel walks you
-  through it if it isn't there. On Arch, download
-  `windscribe-cli_*_amd64.pkg.tar.zst` from
-  [windscribe.com/download](https://windscribe.com/download) (Linux) and
-  install it with `sudo pacman -U`. The CLI needs `nftables` and a few
-  base packages (the package manager resolves them) and enables a
-  `windscribe-helper` system service plus a `windscribe` user service.
+  through it if it isn't there. On Arch (x86_64), download exactly
+  `windscribe-cli_2.25.8_amd64.pkg.tar.zst` (2.25.8 is the current stable
+  release) from the Linux section of
+  [windscribe.com/download](https://windscribe.com/download); Windscribe
+  publishes the same file on
+  [their GitHub releases](https://github.com/Windscribe/Desktop-App/releases/tag/v2.25.8).
+  Check it against the SHA-256 Windscribe prints in that release's notes
+  ("CLI Installer Hashes") before the privileged install — never
+  `pacman -U` a wildcard, which would install a stale or unrelated
+  matching file just as happily:
+
+  ```bash
+  sha256sum ~/Downloads/windscribe-cli_2.25.8_amd64.pkg.tar.zst
+  # expected: c469f7cff7b747076beecc6fa811ae7de515282af39e34fcda282729ee2919b3
+  sudo pacman -U ~/Downloads/windscribe-cli_2.25.8_amd64.pkg.tar.zst
+  ```
+
+  The CLI needs `nftables` and a few base packages (the package manager
+  resolves them) and enables a `windscribe-helper` system service plus a
+  `windscribe` user service.
 
 That's it.
 
@@ -96,8 +110,10 @@ Then click the Windscribe mark in your bar. The panel walks you through the
 rest:
 
 1. **Install the Windscribe CLI** if it isn't there: the row opens a
-   terminal with the exact steps (the install itself needs your password,
-   since it's a system package).
+   terminal with the exact steps — one named package file, its published
+   SHA-256 checked before anything privileged, and `sudo pacman -U` on
+   that exact file alone. The install itself needs your password, since
+   it's a system package.
 2. **Sign in**: type your Windscribe username or email in the panel and
    press Enter. A terminal opens for your password and 2FA code, then
    closes.
@@ -444,7 +460,10 @@ Include mode. Which is why:
   launches through a terminal chooser or a web-app handler.
 
 Windscribe's own GUI reads and writes the same settings file this widget
-edits, so the two stay in agreement whichever one you change it from.
+edits, with the same string-list encoding — the one Qt's settings parser
+defines — so the two stay in agreement whichever one you change it from.
+An app path containing a comma, quote or space stays one entry under that
+encoding, not several.
 
 ### Rotate IP
 
@@ -524,24 +543,40 @@ message, not escaped.
 
 **Settings writes.** The always-on firewall, split tunneling, the app
 list and LAN traffic live in Windscribe's INI settings file, which the
-engine watches and applies as soon as it's saved. What that means in
+engine watches and applies as soon as it's saved — and which it rewrites
+itself whenever its own state changes. Every save therefore goes through
+one bundled helper (`confedit.py`, stdlib-only Python like the other two)
+rather than the shell's cached copy of the file. What that means in
 practice:
 
 - It only ever happens when you flip one of those switches. Nothing is
   written on start-up, on a poll, or when you connect.
-- The edit is surgical: one `Key=value` line changes; every other byte of
-  the file — section order, unknown keys, spacing — comes back exactly as
-  found. A diff before and after a change shows the one line and nothing
-  else.
-- If the file is missing or unreadable, nothing is written and the row
+- The helper reads the file from disk at the moment of the edit, so a
+  newer change the engine just saved can't be reverted by a stale copy.
+  The read-modify-write window is the helper's own few milliseconds, not
+  the age of a cache.
+- The edit is surgical and per-setting: exactly one `Key=value` line
+  changes, and every other byte of the file — section order, unknown
+  keys, spacing — comes back exactly as found. A diff before and after a
+  change shows the one line and nothing else, not even an extra
+  newline.
+- After writing, the helper reads the key back, so the rows confirm the
+  value the engine actually has. If the engine replaced the value in the
+  same instant, the row says so rather than pretending the click took.
+- If the file, section or key is missing, nothing is written and the row
   says Windscribe hasn't written its settings yet. The widget never
   creates the file.
 - App paths only ever come from the widget's own scan of installed apps,
-  and anything that isn't an absolute path is dropped rather than repaired.
-- Writes are atomic (written aside, then renamed into place), so an
-  interrupted write can't leave you with half a settings file.
-- Nothing is written while a CLI action is running, so the two can't land
-  on the file at once.
+  and anything that isn't an absolute path is dropped rather than
+  repaired. The list is written with the string-list encoding Qt's own
+  settings parser defines, so a path with a comma, quote or space in it
+  stays one entry under the engine's reader, not several.
+- Writes are atomic (written aside in the same directory, then renamed
+  into place with the file's permissions kept), so an interrupted write
+  can't leave you with half a settings file.
+- Nothing is written while a CLI action is running, and saves queue
+  behind one another with the last one winning, so two of ours can't
+  land on the file at once either.
 
 **What's visible to other processes.** Omarchy exposes every plugin over
 a Quickshell IPC socket under `/run/user/<uid>/`, which only your own user
@@ -573,6 +608,14 @@ poll confirms or rolls it back — because a connect legitimately takes up
 to a minute and a half. `status` while a connect is in flight reports the
 old state, and the panel says "Connecting…" over it until the answer
 lands.
+
+If the engine stops answering altogether — three polls in a row with no
+answer — the widget stops claiming anything: the bar drops its protected
+look, the hero and the IPC `status` read "Status unknown", and a
+notification fires if the bar was claiming protection at the time. The
+unknown state never reads as "not protected": an engine that isn't
+answering could have a tunnel up that can't be seen. A fresh poll that
+lands repopulates everything.
 
 **More than one monitor.** The bar draws one copy of the widget per
 screen, and the engine would refuse the overlapping CLI runs, so every
