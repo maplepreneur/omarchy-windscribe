@@ -601,9 +601,11 @@ Item {
     var was = statusConnected
     applyStatus(text)
     // A tunnel we didn't ask to close is the one thing a person must hear
-    // about: the icon dimming is not a signal most people read.
+    // about: the icon dimming is not a signal most people read. Low, not
+    // critical: omarchy-shell parks a critical toast in the corner until it
+    // is clicked, while low fades out on its own after 5 s.
     if (was && !parsed.connected && !_expectDown && !actionProcess.running && !connectProcess.running)
-      notify("VPN Disconnected 󰻌", "You're no longer protected.", "critical")
+      notify("VPN Disconnected 󰻌", "You're no longer protected.", "low")
     _expectDown = false
     if (was !== parsed.connected) {
       trafficReset()
@@ -1080,6 +1082,10 @@ Item {
     // hint gives the shell a Nerd Font shield-lock to draw if the SVG isn't
     // there yet (first launch) or fails to load. Signature: app_name,
     // replaces_id, app_icon, summary, body, actions, hints, expire_timeout.
+    // Urgency is the caller's only say in how long the toast stays:
+    // omarchy-shell draws low for 5 s and normal for 8 s, ignores a shorter
+    // expire_timeout, and keeps a critical toast on screen until it is
+    // clicked. Both callers here pass "low" so toasts fade out on their own.
     var level = urgency === "critical" ? "2" : (urgency === "low" ? "0" : "1")
     Quickshell.execDetached(["busctl", "--user", "--", "call",
                              "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
@@ -1498,7 +1504,7 @@ Item {
           }
         }
         root.recordRecent(target)
-        root.notify("VPN Connected \udb82\udd9d", root.displayPlace || "Connected", "normal")
+        root.notify("VPN Connected \udb82\udd9d", root.displayPlace || "Connected", "low")
       }
       // Look at the engine now rather than waiting for the poll, so the
       // override is released against fresh data as soon as possible.

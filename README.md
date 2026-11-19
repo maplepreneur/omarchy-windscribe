@@ -495,9 +495,11 @@ seconds, because signing out also disconnects.
 
 If the VPN drops unexpectedly you get a desktop notification, "VPN
 Disconnected, You're no longer protected." Connecting shows "VPN
-Connected" with the place. Neither shows while the panel is open, since
-the panel already tells you. Turn both off in the widget's settings if
-you'd rather not.
+Connected" with the place. Both go out as low urgency, so Omarchy's
+shell fades them out after about five seconds instead of parking them
+in the corner; a critical toast would wait for a click. Neither shows
+while the panel is open, since the panel already tells you. Turn both
+off in the widget's settings if you'd rather not.
 
 ## Settings
 
