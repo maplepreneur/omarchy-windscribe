@@ -562,25 +562,30 @@ practice:
   written on start-up, on a poll, or when you connect.
 - The helper reads the file from disk at the moment of the edit, so a
   newer change the engine just saved can't be reverted by a stale copy.
-  The commit is an atomic compare-and-swap where Linux allows it
+  The commit is an atomic exchange where Linux allows it
   (`renameat2` with `RENAME_EXCHANGE`): the staged file and the conf
-  file swap names atomically, and the displaced file tells the helper
-  exactly what its edit replaced. If that is the engine's newer save,
-  it is put back on the active file — the one Windscribe reloads —
-  before the edit is staged again, so a failed merge does not leave
-  that save only in a side file. If overlapping saves exhaust the merge
-  attempts, the newest displaced snapshot is journaled beside the conf
-  file; a later run publishes it to the active file before it is
-  allowed to report success, and will not claim an older preferences
-  file while that save is still sitting unread. A displaced copy is
-  never deleted if the helper could not read it. Success means the
-  active file is the newest observed content plus the one change. A
-  save landing after the commit is caught by the whole-file read-back
-  and reconciled the same way. Where the exchange is unavailable, the
-  helper falls back to a last identity check back to back with the
-  rename — a microsecond gap, no wider than the window the engine's own
-  writer accepts on every save — and the docstring says what that
-  leaves open.
+  file swap names, so the helper ends up holding exactly the file its
+  edit replaced. Which preferences file is newer is decided by file
+  identity, never by comparing contents: every inode involved is held
+  open for the run, and an atomic swap can only hand back the file that
+  was active at that instant. If the edit displaced a newer engine save,
+  that save is swapped straight back onto the active file — the one
+  Windscribe reloads — and if the engine saves again in the middle,
+  the newer save it hands back is swapped in next, until a swap returns
+  exactly the file the helper put there (proof nothing landed in
+  between). Only then is the edit re-applied on top. A side copy is
+  deleted only when a later save has provably replaced it, never because
+  of what its bytes look like, and never unread or after a failed look.
+  Before every swap a one-line journal is fsynced beside the conf file,
+  so a crash, an I/O error or a give-up leaves the newer save on disk
+  and recorded; the next run finishes putting it back before it edits
+  anything, and is not allowed to report success while a newer save
+  might still be held aside. Success means the active file was, at the
+  moment of the check, the newest engine save plus the one change. Where
+  the exchange is unavailable, the helper falls back to a last identity
+  check back to back with the rename — a microsecond gap, no wider than
+  the window the engine's own writer accepts on every save — and the
+  docstring says what that leaves open.
 - The edit is surgical and per-setting: exactly one `Key=value` line
   changes, and every other byte of the file — section order, unknown
   keys, spacing — comes back exactly as found. A diff before and after a

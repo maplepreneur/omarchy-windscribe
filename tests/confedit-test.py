@@ -16,6 +16,8 @@ saving the file at the worst possible moment, then restores it. Run:
 
     python3 tests/confedit-test.py
 """
+import contextlib
+import io
 import os
 import shutil
 import sys
@@ -55,7 +57,8 @@ def make_conf(tmp):
 
 
 def run(path, key, value, section="Connection"):
-    return confedit.main(["confedit.py", path, section, key, value])
+    with contextlib.redirect_stdout(io.StringIO()):
+        return confedit.main(["confedit.py", path, section, key, value])
 
 
 def read(path):
@@ -309,154 +312,233 @@ try:
 finally:
     shutil.rmtree(tmp)
 
-print("confedit.py: a later retry adopts a journaled newer save before succeeding")
-tmp = tempfile.mkdtemp(prefix="ws-confedit-")
-try:
-    if confedit.exchange_paths is None:
-        print("skip -- no renameat2 on this platform")
-    else:
+class Crash(BaseException):
+    """Stands in for SIGKILL / power loss: unwinds past every except
+    OSError, so only what is already on disk survives."""
+
+
+def ident_of(path):
+    return confedit.identity(os.stat(path))
+
+
+def edited(text):
+    return text.replace("FirewallMode=Auto", "FirewallMode=Always On")
+
+
+def journal_open(path):
+    return os.path.exists(os.path.join(os.path.dirname(path), ".confedit-journal"))
+
+
+def litter(tmp):
+    return sorted(name for name in os.listdir(tmp) if name != "windscribe_cli.conf")
+
+
+def quiet_retry(path, key="FirewallMode", value="Always On"):
+    """A later edit with no engine activity; returns its exit code."""
+    return run(path, key, value)
+
+
+def hooks(fsync=None, pre=None, post=None, read=None):
+    """Install engine/crash hooks at the helper's I/O points. Returns an
+    undo function. Each hook gets a running call index."""
+    real_fsync = os.fsync
+    real_exchange = confedit.exchange_paths
+    real_read = confedit.read_lines
+    counts = {"fsync": 0, "exchange": 0, "read": 0}
+
+    def fsync_hook(fd):
+        r = real_fsync(fd)
+        counts["fsync"] += 1
+        if fsync:
+            fsync(counts["fsync"])
+        return r
+
+    def exchange_hook(old, new):
+        counts["exchange"] += 1
+        n = counts["exchange"]
+        if pre:
+            pre(n)
+        r = real_exchange(old, new)
+        if post:
+            post(n)
+        return r
+
+    def read_hook(target):
+        lines = real_read(target)
+        counts["read"] += 1
+        if read:
+            read(counts["read"])
+        return lines
+
+    os.fsync = fsync_hook
+    confedit.exchange_paths = exchange_hook
+    confedit.read_lines = read_hook
+
+    def undo():
+        os.fsync = real_fsync
+        confedit.exchange_paths = real_exchange
+        confedit.read_lines = real_read
+
+    return undo
+
+
+class Engine:
+    """The engine's saves, numbered: save n writes DNSManager=E<n>."""
+
+    def __init__(self, path, base):
+        self.path = path
+        self.base = base
+        self.n = 0
+
+    def save(self, *_ignored):
+        self.n += 1
+        engine_save(self.path, self.newest())
+
+    def newest(self):
+        if self.n == 0:
+            return self.base
+        return self.base.replace("DNSManager=Auto", "DNSManager=E%d" % self.n)
+
+
+def exhausted_state(tmp):
+    """Drive a real run into publish exhaustion: the engine saves before
+    every swap, forever. Returns (path, engine) with a journal and a hold
+    outstanding and the newest save held aside."""
+    path = make_conf(tmp)
+    engine = Engine(path, read(path))
+    undo = hooks(pre=engine.save)
+    try:
+        result = run(path, "FirewallMode", "Always On")
+    finally:
+        undo()
+    return path, engine, result
+
+
+if confedit.exchange_paths is None:
+    print("skip -- the remaining scenarios need renameat2")
+else:
+    print("confedit.py: a later retry adopts a journaled newer save before succeeding")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
         path = make_conf(tmp)
         original = read(path)
-        # The state left when merge attempts exhaust: the active file is
-        # an older install of ours, and a side file holds the engine's
-        # newest save. A later retry must not report success until that
-        # save is the active file.
+        # The state publish exhaustion leaves: the active file is an
+        # older file the helper put there, and the hold has a newer save
+        # that came back from the last swap.
         older = original.replace("FirewallMode=Auto", "FirewallMode=Always On")
         newest = original.replace("Autoconnect=false", "Autoconnect=true").replace(
             "DNSManager=Auto", "DNSManager=Newest")
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(older)
+        engine_save(path, older)
         hold = os.path.join(tmp, ".confedit-held")
         with open(hold, "w", encoding="utf-8") as handle:
             handle.write(newest)
-        confedit._add_record(path, hold, confedit.text_sha(older))
-        confedit._set_displaced(path, hold, confedit.text_sha(newest))
+        unrelated = os.path.join(tmp, ".confedit-prev")
+        with open(unrelated, "w") as handle:
+            handle.write("x")
+        confedit.save_journal(path, {"hold": hold, "ours": False,
+                                     "put": ident_of(path), "prev": ident_of(unrelated)})
+        os.unlink(unrelated)
         result = run(path, "SplitTunnelingEnabled", "true")
         eq("later retry confirms on top of the journaled save", result, 0)
         final = read(path)
         ok("newest engine setting is active", "DNSManager=Newest" in final, final)
         ok("newest autoconnect is active", "Autoconnect=true" in final)
         ok("retried key written", "SplitTunnelingEnabled=true" in final)
-        ok("no newer save left only in a side file",
-           not any(name.startswith(".confedit-") and name != ".confedit.lock"
-                   for name in os.listdir(tmp)))
-finally:
-    shutil.rmtree(tmp)
+        eq("no side file or journal left", litter(tmp), [])
+    finally:
+        shutil.rmtree(tmp)
 
-print("confedit.py: a failed read of the displaced file does not delete it")
-tmp = tempfile.mkdtemp(prefix="ws-confedit-")
-try:
-    if confedit.exchange_paths is None:
-        print("skip -- no renameat2 on this platform")
-    else:
+    print("confedit.py: a journaled hold is dropped only when a later save proves it older")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
+        path = make_conf(tmp)
+        original = read(path)
+        older = original.replace("DNSManager=Auto", "DNSManager=Held")
+        hold = os.path.join(tmp, ".confedit-held")
+        with open(hold, "w", encoding="utf-8") as handle:
+            handle.write(older)
+        unrelated = os.path.join(tmp, ".confedit-prev")
+        with open(unrelated, "w") as handle:
+            handle.write("x")
+        confedit.save_journal(path, {"hold": hold, "ours": False,
+                                     "put": ident_of(path), "prev": ident_of(unrelated)})
+        os.unlink(unrelated)
+        # The engine saves after the hold left the active name: that save
+        # is the newer one, whatever its bytes look like.
+        later = original.replace("Autoconnect=false", "Autoconnect=true")
+        engine_save(path, later)
+        eq("edit lands", run(path, "FirewallMode", "Always On"), 0)
+        eq("the later save is kept, the older hold is not published",
+           read(path), edited(later))
+        eq("obsolete hold removed", litter(tmp), [])
+    finally:
+        shutil.rmtree(tmp)
+
+    print("confedit.py: a failed look at the displaced file keeps it and publishes it next run")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
         path = make_conf(tmp)
         engine_text = read(path).replace("Autoconnect=false", "Autoconnect=true")
-        # The engine saves in the instant before the commit, so the swap
-        # displaces the newer preferences. The first read of that displaced
-        # file fails. The helper must not unlink it -- the previous code
-        # deleted it in the cleanup that runs on any exception.
-        real_read = confedit.read_lines
-        real_exchange = confedit.exchange_paths
-        state = {"swapped": False, "failed": False}
+        real_ident = confedit.Run.ident
+        state = {"armed": False, "failed": False}
 
-        def exchange_once(old, new):
-            if not state["swapped"]:
-                state["swapped"] = True
-                engine_save(path, engine_text)
-            return real_exchange(old, new)
-
-        def read_fail_displaced(target):
-            lines = real_read(target)
-            if (not state["failed"] and target != path
-                    and "Autoconnect=true" in "\n".join(lines)):
+        def ident_fail_hold(self, target):
+            if state["armed"] and not state["failed"] and target != self.conf:
                 state["failed"] = True
                 raise OSError(5, "Input/output error")
-            return lines
+            return real_ident(self, target)
 
-        confedit.exchange_paths = exchange_once
-        confedit.read_lines = read_fail_displaced
+        def arm(_n):
+            if not state["armed"]:
+                state["armed"] = True
+
+        undo = hooks(pre=lambda n: engine_save(path, engine_text) if n == 1 else None,
+                     post=arm)
+        confedit.Run.ident = ident_fail_hold
         try:
             result = run(path, "FirewallMode", "Always On")
         finally:
-            restore(confedit, "exchange_paths", real_exchange)
-            restore(confedit, "read_lines", real_read)
-        ok("failed displaced read did not report success without the save",
-           result != 0 or "Autoconnect=true" in read(path),
-           "exit " + str(result))
-        present = []
-        for name in os.listdir(tmp):
-            text = read(os.path.join(tmp, name))
-            if "Autoconnect=true" in text:
-                present.append(name)
-        ok("displaced save was not deleted when its read failed",
-           bool(present), "dir " + str(os.listdir(tmp)))
-        if result != 0:
-            retry = run(path, "FirewallMode", "Always On")
-            eq("later retry after a failed displaced read", retry, 0)
-            final = read(path)
-            ok("newer save is the active file after the retry",
-               "Autoconnect=true" in final, final)
-            ok("own key written on top of the restored save",
-               "FirewallMode=Always On" in final)
-        else:
-            ok("success left the newer save active",
-               "Autoconnect=true" in read(path))
-finally:
-    shutil.rmtree(tmp)
+            confedit.Run.ident = real_ident
+            undo()
+        eq("unclassifiable hold is an I/O error, not success", result, 6)
+        held = [name for name in os.listdir(tmp)
+                if "Autoconnect=true" in read(os.path.join(tmp, name))]
+        ok("displaced save kept on disk", bool(held), str(os.listdir(tmp)))
+        ok("journal kept", journal_open(path))
+        eq("later retry publishes the preserved save", quiet_retry(path), 0)
+        eq("preserved save active, edit on top", read(path), edited(engine_text))
+        eq("no litter", litter(tmp), [])
+    finally:
+        shutil.rmtree(tmp)
 
-print("confedit.py: a failed read still keeps the displaced file if restore fails")
-tmp = tempfile.mkdtemp(prefix="ws-confedit-")
-try:
-    if confedit.exchange_paths is None:
-        print("skip -- no renameat2 on this platform")
-    else:
+    print("confedit.py: a failed restore swap keeps the newer save and publishes it next run")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
         path = make_conf(tmp)
         engine_text = read(path).replace("Autoconnect=false", "Autoconnect=true")
-        # Forward swap displaces the newer save, the read of it fails, and
-        # the swap that would put it back also fails. The previous cleanup
-        # unlinked the displaced file on that exception. It must survive,
-        # and a later retry must publish it to the active file before
-        # reporting success.
-        real_read = confedit.read_lines
         real_exchange = confedit.exchange_paths
-        state = {"n": 0, "failed": False}
+        calls = {"n": 0}
 
         def exchange_then_fail(old, new):
-            state["n"] += 1
-            if state["n"] == 1:
+            calls["n"] += 1
+            if calls["n"] == 1:
                 engine_save(path, engine_text)
                 return real_exchange(old, new)
             raise OSError(5, "Input/output error")
 
-        def read_fail_displaced(target):
-            lines = real_read(target)
-            if (not state["failed"] and target != path
-                    and "Autoconnect=true" in "\n".join(lines)):
-                state["failed"] = True
-                raise OSError(5, "Input/output error")
-            return lines
-
         confedit.exchange_paths = exchange_then_fail
-        confedit.read_lines = read_fail_displaced
         try:
             result = run(path, "FirewallMode", "Always On")
         finally:
-            restore(confedit, "exchange_paths", real_exchange)
-            restore(confedit, "read_lines", real_read)
-        eq("unreadable displaced save is an I/O error, not success", result, 6)
-        held = [name for name in os.listdir(tmp)
-                if "Autoconnect=true" in read(os.path.join(tmp, name))]
-        ok("displaced copy survived the failed read and the failed restore",
-           bool(held), "dir " + str(os.listdir(tmp)))
-        retry = run(path, "FirewallMode", "Always On")
-        eq("later retry publishes the preserved save", retry, 0)
-        final = read(path)
-        ok("preserved save is active after the retry",
-           "Autoconnect=true" in final, final)
-        ok("own key written on the preserved save",
-           "FirewallMode=Always On" in final)
-finally:
-    shutil.rmtree(tmp)
+            confedit.exchange_paths = real_exchange
+        eq("failed restore is an I/O error", result, 6)
+        ok("newer save still on disk",
+           any("Autoconnect=true" in read(os.path.join(tmp, n)) for n in os.listdir(tmp)))
+        eq("later retry", quiet_retry(path), 0)
+        eq("newer save active with the edit", read(path), edited(engine_text))
+        eq("no litter", litter(tmp), [])
+    finally:
+        shutil.rmtree(tmp)
 
 print("confedit.py: three overlapping saves merge in order and leave no litter")
 tmp = tempfile.mkdtemp(prefix="ws-confedit-")
@@ -510,9 +592,9 @@ try:
             "[General]\nLanguage=en\n\n[Connection]\nAutoconnect=false\n"
             "FirewallMode=Auto\nSplitTunnelingEnabled=false\n\n[Advanced]\nDNSManager=Auto\n")
         a = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(confedit.__file__), "confedit.py"),
-                              path, "Connection", "FirewallMode", "Always On"])
+                              path, "Connection", "FirewallMode", "Always On"], stdout=subprocess.DEVNULL)
         b = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(confedit.__file__), "confedit.py"),
-                              path, "Connection", "SplitTunnelingEnabled", "true"])
+                              path, "Connection", "SplitTunnelingEnabled", "true"], stdout=subprocess.DEVNULL)
         a.wait()
         b.wait()
         final = read(path)
@@ -607,6 +689,287 @@ try:
     eq("engine's file stands untouched", read(path), engine_text)
 finally:
     shutil.rmtree(tmp)
+
+if confedit.exchange_paths is not None:
+    # ---- The reviewer's last finding, at 5153110: a Windscribe save that
+    # overlaps the recovery of an earlier give-up must never be discarded
+    # as obsolete, and several overlapping saves must never leave an older
+    # version active, whether the earlier run reported 5, 6, or crashed.
+
+    def leftover_state(tmp, kind):
+        """An earlier run that did not finish. Returns (path, engine)."""
+        path = make_conf(tmp)
+        engine = Engine(path, read(path))
+        if kind == "exhausted":
+            undo = hooks(pre=engine.save)
+        elif kind == "io-error":
+            real = confedit.exchange_paths
+            calls = {"n": 0}
+
+            def failing(old, new):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    engine.save()
+                    return real(old, new)
+                raise OSError(5, "Input/output error")
+
+            confedit.exchange_paths = failing
+            undo = lambda: setattr(confedit, "exchange_paths", real)
+        else:  # crash-<when>-<n>: crash around the n-th swap
+            _crash, when, nth = kind.split("-")
+            nth = int(nth)
+
+            def boom(n):
+                if n == nth:
+                    raise Crash()
+
+            undo = hooks(pre=lambda n: (engine.save() if n == 1 else None,
+                                        boom(n) if when == "pre" else None),
+                         post=lambda n: boom(n) if when == "post" else None)
+        try:
+            first = run(path, "FirewallMode", "Always On")
+        except Crash:
+            first = "crash"
+        finally:
+            undo()
+        return path, engine, first
+
+    overlaps = {
+        "none": lambda engine: hooks(),
+        "save before a recovery swap": lambda engine: hooks(
+            pre=lambda n: engine.save() if n == 1 else None),
+        "save after a recovery swap": lambda engine: hooks(
+            post=lambda n: engine.save() if n == 1 else None),
+        "save during the recovery journal write": lambda engine: hooks(
+            fsync=lambda n: engine.save() if n == 1 else None),
+        "three saves across recovery": lambda engine: hooks(
+            pre=lambda n: engine.save() if n <= 3 else None),
+        "six saves across recovery": lambda engine: hooks(
+            pre=lambda n: engine.save() if n <= 6 else None,
+            post=lambda n: engine.save() if n in (2, 4) else None),
+    }
+    kinds = ["exhausted", "io-error", "crash-pre-1", "crash-post-1",
+             "crash-pre-2", "crash-post-2", "crash-pre-3", "crash-post-3"]
+
+    print("confedit.py: overlapping saves during recovery never lose the newest preferences")
+    matrix_ok = 0
+    matrix_total = 0
+    for kind in kinds:
+        for label, install in overlaps.items():
+            tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+            try:
+                path, engine, first = leftover_state(tmp, kind)
+                matrix_total += 1
+                problems = []
+                if first == 0 and read(path) != edited(engine.newest()):
+                    problems.append("first run claimed success over an older file")
+                undo = install(engine)
+                try:
+                    second = run(path, "FirewallMode", "Always On")
+                finally:
+                    undo()
+                if second == 0 and read(path) != edited(engine.newest()):
+                    problems.append("overlapped retry reported success with older settings")
+                if second != 0 and not journal_open(path) \
+                        and read(path) not in (engine.newest(), edited(engine.newest())):
+                    problems.append("older version left active with nothing journaled")
+                newest_marker = engine.newest()
+                if not any(read(os.path.join(tmp, n)) in (newest_marker, edited(newest_marker))
+                           for n in os.listdir(tmp) if not n.startswith(".confedit-journal")):
+                    problems.append("newest save lost")
+                third = quiet_retry(path)
+                if third != 0:
+                    problems.append("quiet retry exit %r" % third)
+                if read(path) != edited(engine.newest()):
+                    problems.append("final file is not the newest save plus the edit")
+                if litter(tmp):
+                    problems.append("litter %r" % litter(tmp))
+                if problems:
+                    print("     %s / %s: %s" % (kind, label, "; ".join(problems)))
+                else:
+                    matrix_ok += 1
+            finally:
+                shutil.rmtree(tmp)
+    ok("every give-up x overlap combination keeps the newest save (%d/%d)"
+       % (matrix_ok, matrix_total), matrix_ok == matrix_total)
+
+    print("confedit.py: a recovery overlapped forever is reported, never claimed")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
+        path, engine, first = exhausted_state(tmp)
+        eq("first run reports the race", first, 5)
+        ok("journal outstanding after the give-up", journal_open(path))
+        undo = hooks(pre=engine.save)
+        try:
+            second = run(path, "FirewallMode", "Always On")
+        finally:
+            undo()
+        eq("overlapped-forever recovery reports the race", second, 5)
+        ok("the race leaves the journal, so the newest save is not orphaned",
+           journal_open(path))
+        eq("quiet retry", quiet_retry(path), 0)
+        eq("newest save plus edit", read(path), edited(engine.newest()))
+        eq("no litter", litter(tmp), [])
+    finally:
+        shutil.rmtree(tmp)
+
+    print("confedit.py: a crash at any durable step loses nothing")
+    crash_ok = 0
+    crash_total = 0
+    for engine_at in range(0, 6):
+        for crash_at in range(1, 16):
+            tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+            try:
+                path = make_conf(tmp)
+                engine = Engine(path, read(path))
+
+                def on_fsync(n, engine=engine, engine_at=engine_at, crash_at=crash_at):
+                    if n == engine_at:
+                        engine.save()
+                    if n == crash_at:
+                        raise Crash()
+
+                undo = hooks(fsync=on_fsync,
+                             pre=lambda n, engine=engine, engine_at=engine_at:
+                                 engine.save() if engine_at and n == 1 else None)
+                try:
+                    try:
+                        first = run(path, "FirewallMode", "Always On")
+                    except Crash:
+                        first = "crash"
+                finally:
+                    undo()
+                crash_total += 1
+                problems = []
+                if first == 0 and read(path) != edited(engine.newest()):
+                    problems.append("success over an older file")
+                retry = quiet_retry(path)
+                if retry != 0:
+                    problems.append("retry exit %r" % retry)
+                if read(path) != edited(engine.newest()):
+                    problems.append("final is not newest + edit")
+                if litter(tmp):
+                    problems.append("litter %r" % litter(tmp))
+                if problems:
+                    print("     engine@%d crash@%d: %s" % (engine_at, crash_at, "; ".join(problems)))
+                else:
+                    crash_ok += 1
+            finally:
+                shutil.rmtree(tmp)
+    ok("crash sweep (%d/%d)" % (crash_ok, crash_total), crash_ok == crash_total)
+
+    print("confedit.py: randomized interleavings of saves, faults and crashes")
+    import random
+    fuzz_ok = 0
+    fuzz_runs = int(os.environ.get("CONFEDIT_FUZZ_RUNS", "400"))
+    for seed in range(fuzz_runs):
+        rng = random.Random(seed)
+        tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+        try:
+            path = make_conf(tmp)
+            engine = Engine(path, read(path))
+            p_save = rng.choice([0.1, 0.3, 0.6, 0.9])
+            p_crash = rng.choice([0.0, 0.0, 0.03, 0.08])
+            problems = []
+
+            def maybe(_n):
+                if rng.random() < p_save:
+                    engine.save()
+                if rng.random() < p_crash:
+                    raise Crash()
+
+            for round_ in range(rng.randint(1, 4)):
+                undo = hooks(fsync=maybe, pre=maybe, post=maybe, read=maybe)
+                try:
+                    try:
+                        result = run(path, "FirewallMode", "Always On")
+                    except Crash:
+                        result = "crash"
+                finally:
+                    undo()
+                newest = engine.newest()
+                if result == 0 and read(path) != edited(newest):
+                    problems.append("round %d: success over an older file" % round_)
+                if result == 0 and journal_open(path):
+                    problems.append("round %d: success with a journal outstanding" % round_)
+                if not any(read(os.path.join(tmp, n)) in (newest, edited(newest))
+                           for n in os.listdir(tmp) if not n.startswith(".confedit-journal")):
+                    problems.append("round %d: newest save lost" % round_)
+                if not journal_open(path) and \
+                        read(path) not in (newest, edited(newest)):
+                    problems.append("round %d: older file active, nothing journaled" % round_)
+            final = quiet_retry(path)
+            if final != 0 or read(path) != edited(engine.newest()) or litter(tmp):
+                problems.append("final exit %r litter %r" % (final, litter(tmp)))
+            if problems:
+                print("     seed %d: %s" % (seed, "; ".join(problems)))
+            else:
+                fuzz_ok += 1
+        finally:
+            shutil.rmtree(tmp)
+    ok("randomized interleavings (%d/%d)" % (fuzz_ok, fuzz_runs), fuzz_ok == fuzz_runs)
+
+    print("confedit.py: live stress against a real concurrent renaming writer")
+    import threading
+    import time
+    live_ok = 0
+    live_runs = 40
+    for i in range(live_runs):
+        tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+        try:
+            path = make_conf(tmp)
+            engine = Engine(path, read(path))
+            stop = threading.Event()
+
+            def writer():
+                while not stop.is_set():
+                    engine.save()
+                    time.sleep(0.0002 * (i % 5))
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            try:
+                result = run(path, "FirewallMode", "Always On")
+            finally:
+                stop.set()
+                thread.join()
+            newest = engine.newest()
+            good = True
+            if not journal_open(path):
+                # Nothing held aside: the engine's last save, or our edit
+                # of it, must be what is active.
+                good = read(path) in (newest, edited(newest))
+            retry = quiet_retry(path)
+            good = good and retry == 0 and read(path) == edited(newest) and not litter(tmp)
+            if good:
+                live_ok += 1
+            else:
+                print("     live run %d: exit %r, retry %r" % (i, result, retry))
+        finally:
+            shutil.rmtree(tmp)
+    ok("live stress (%d/%d)" % (live_ok, live_runs), live_ok == live_runs)
+
+    print("confedit.py: a leftover v1.0.6 journal is finished, not ignored")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
+        path = make_conf(tmp)
+        original = read(path)
+        import hashlib
+        sha = lambda t: hashlib.sha256(t.encode()).hexdigest()
+        older = edited(original)
+        newest = original.replace("DNSManager=Auto", "DNSManager=Legacy")
+        engine_save(path, older)
+        hold = os.path.join(tmp, ".confedit-legacyhold")
+        with open(hold, "w") as handle:
+            handle.write(newest)
+        with open(os.path.join(tmp, ".confedit-journal"), "w") as handle:
+            handle.write("\t".join((sha(older), sha(newest), "swap", "-", hold)) + "\n")
+        eq("edit after a legacy journal", run(path, "SplitTunnelingEnabled", "true"), 0)
+        final = read(path)
+        ok("legacy held save published", "DNSManager=Legacy" in final, final)
+        eq("legacy journal and hold cleared", litter(tmp), [])
+    finally:
+        shutil.rmtree(tmp)
 
 print("")
 print(str(pass_count) + " passed, " + str(fail_count) + " failed")
