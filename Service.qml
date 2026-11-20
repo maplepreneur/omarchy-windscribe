@@ -103,12 +103,14 @@ Item {
   // with an atomic renameat2(RENAME_EXCHANGE) swap where Linux allows it:
   // the displaced file proves what the edit replaced, so an engine save
   // that overlaps the commit is merged under the edit, never overwritten
-  // unseen, and a save landing after it is caught by the whole-file
-  // read-back and reconciled the same way. Where the exchange is
-  // unavailable the helper falls back to a last identity check back to
-  // back with the rename, with a documented microsecond gap. The key is
-  // read back so the rows can confirm what the engine actually has, never
-  // what we asked for. The FileView below only reads and watches.
+  // unseen — and it stays on disk until the merge lands, so a crash
+  // mid-merge cannot destroy it. A save landing after the commit is
+  // caught by the whole-file read-back and reconciled the same way.
+  // Where the exchange is unavailable the helper falls back to a last
+  // identity check back to back with the rename, with a documented
+  // microsecond gap. The key is read back so the rows can confirm what
+  // the engine actually has, never what we asked for. The FileView
+  // below only reads and watches.
   readonly property string confPath:
     (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config"))
     + "/Windscribe/windscribe_cli.conf"

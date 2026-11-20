@@ -208,6 +208,155 @@ try:
 finally:
     shutil.rmtree(tmp)
 
+print("confedit.py: a failed merge keeps the newer save on disk, not destroyed")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        engine_text = read(path).replace("Autoconnect=false", "Autoconnect=true")
+        # The engine saves during the first staging, forcing a rebase;
+        # the staging of the merged file then fails (a full disk, say).
+        # The newer save must survive somewhere on disk -- the previous
+        # commit unlinked it at this exact point and lost it for good.
+        fires = {"n": 0}
+        real_fsync = os.fsync
+        def fsync_hook(fd):
+            r = real_fsync(fd)
+            if fires["n"] == 0:
+                fires["n"] += 1
+                engine_save(path, engine_text)
+            return r
+        real_stage = confedit.stage_write
+        def failing_stage(path_arg, text_arg, mode_arg):
+            if fires["n"] == 1:
+                raise OSError(28, "No space left on device")
+            return real_stage(path_arg, text_arg, mode_arg)
+        os.fsync = fsync_hook
+        confedit.stage_write = failing_stage
+        try:
+            result = run(path, "FirewallMode", "Always On")
+        finally:
+            os.fsync = real_fsync
+            confedit.stage_write = real_stage
+        eq("merge failure reported as I/O error", result, 6)
+        survivors = [read(os.path.join(tmp, name))
+                     for name in os.listdir(tmp)]
+        ok("newer save still on disk after the failure",
+           any("Autoconnect=true" in text for text in survivors))
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: rebase exhaustion gives up without destroying the newest save")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        original = read(path)
+        # A pathological engine that saves again before every commit,
+        # forever: the helper must give up (exit 5) and leave the newest
+        # save recoverable, never delete it in frustration.
+        fires = {"n": 0}
+        real = confedit.exchange_paths
+        def storm(old, new):
+            engine_save(path, original.replace(
+                "DNSManager=Auto", "DNSManager=Storm%d" % fires["n"]))
+            fires["n"] += 1
+            return real(old, new)
+        confedit.exchange_paths = storm
+        try:
+            result = run(path, "FirewallMode", "Always On")
+        finally:
+            restore(confedit, "exchange_paths", real)
+        eq("unbounded race reported, not claimed", result, 5)
+        survivors = [read(os.path.join(tmp, name))
+                     for name in os.listdir(tmp)]
+        newest = "DNSManager=Storm%d" % (fires["n"] - 1)
+        ok("newest save still on disk after giving up",
+           any(newest in text for text in survivors))
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: three overlapping saves merge in order and leave no litter")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        saves = [read(path).replace("Autoconnect=false", "Autoconnect=true"),
+                 read(path).replace("DNSManager=Auto", "DNSManager=one"),
+                 read(path).replace("DNSManager=Auto", "DNSManager=two")]
+        fires = {"n": 0}
+        real_fsync = os.fsync
+        real_exchange = confedit.exchange_paths
+        def fsync_hook(fd):
+            r = real_fsync(fd)
+            if fires["n"] == 0:
+                fires["n"] += 1
+                engine_save(path, saves[0])
+            return r
+        def exchange_hook(old, new):
+            if fires["n"] in (1, 2):
+                engine_save(path, saves[fires["n"]])
+                fires["n"] += 1
+            return real_exchange(old, new)
+        os.fsync = fsync_hook
+        confedit.exchange_paths = exchange_hook
+        try:
+            result = run(path, "FirewallMode", "Always On")
+        finally:
+            os.fsync = real_fsync
+            restore(confedit, "exchange_paths", real_exchange)
+        eq("three saves reconciled", result, 0)
+        final = read(path)
+        ok("newest engine save merged", "DNSManager=two" in final)
+        ok("own key written", "FirewallMode=Always On" in final)
+        want = saves[2].replace("FirewallMode=Auto", "FirewallMode=Always On")
+        ok("byte-exact edit of the newest save", final == want)
+        ok("no displaced litter after a clean commit", os.listdir(tmp) == ["windscribe_cli.conf"])
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: two helper instances editing different keys land both")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    path = make_conf(tmp)
+    import subprocess
+    landed = 0
+    for _ in range(15):
+        open(path, "w").write(
+            "[General]\nLanguage=en\n\n[Connection]\nAutoconnect=false\n"
+            "FirewallMode=Auto\nSplitTunnelingEnabled=false\n\n[Advanced]\nDNSManager=Auto\n")
+        a = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(confedit.__file__), "confedit.py"),
+                              path, "Connection", "FirewallMode", "Always On"])
+        b = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(confedit.__file__), "confedit.py"),
+                              path, "Connection", "SplitTunnelingEnabled", "true"])
+        a.wait()
+        b.wait()
+        final = read(path)
+        if "FirewallMode=Always On" in final and "SplitTunnelingEnabled=true" in final:
+            landed += 1
+    ok("both edits landed in all 15 concurrent pairs", landed == 15,
+       str(landed) + "/15")
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: a no-op edit is a confirmed no-op")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    path = make_conf(tmp)
+    result = run(path, "FirewallMode", "Auto")  # already Auto
+    eq("no-op exit 0", result, 0)
+    ok("no-op leaves the file alone", read(path) ==
+       "[General]\nLanguage=en\n\n[Connection]\nAutoconnect=false\n"
+       "FirewallMode=Auto\nSplitTunnelingEnabled=false\n\n[Advanced]\nDNSManager=Auto\n")
+finally:
+    shutil.rmtree(tmp)
+
 print("confedit.py: an unavailable exchange demotes to the fallback, still commits")
 tmp = tempfile.mkdtemp(prefix="ws-confedit-")
 try:

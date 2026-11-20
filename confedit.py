@@ -21,12 +21,15 @@ never saw. This helper closes both gaps as far as a non-Qt process can:
     exact file its edit replaced. If that displaced file is still the
     content the edit was based on, no writer interleaved and success is
     provable; if it is the engine's newer save instead, that save is
-    intact in the helper's hands, and the edit is re-applied on top of
-    it and committed again. Either way an overlapping save is never
-    overwritten unseen, so another writer's setting -- a firewall or
-    routing key, say -- cannot be lost while the helper reports success.
-    A save landing after the commit is caught by the whole-file read-back
-    and reconciled the same way
+    kept on disk -- not unlinked -- until the edit re-applied on top of
+    it has been committed and verified, so a crash or a full disk mid-
+    merge cannot destroy it: the settings survive in that dotfile, and
+    even the give-up paths leave it rather than drop a newer save. Only
+    a verified clean commit removes the displaced copies. Either way an
+    overlapping save is never overwritten unseen, so another writer's
+    setting -- a firewall or routing key, say -- cannot be lost while
+    the helper reports success. A save landing after the commit is
+    caught by the whole-file read-back and reconciled the same way
   * where the exchange is unavailable (other OS, other architecture,
     older kernel, unsupporting filesystem) the helper falls back to a
     last identity check back to back with the rename: a microsecond gap
@@ -239,6 +242,7 @@ def main(argv):
         # so a writer is never overwritten unseen.
         believed = lines
         tmp = None
+        pending = []  # displaced files kept until the merged commit lands
         committed = False
         stale = False
         try:
@@ -268,13 +272,31 @@ def main(argv):
                 # the question a plain rename never can: what exactly did
                 # our edit replace?
                 displaced = read_lines(tmp)
-                os.unlink(tmp)
-                tmp = None
                 if displaced == believed:
-                    committed = True  # nothing interleaved: text stands
+                    # Nothing interleaved: our text is installed. The
+                    # displaced copy holds only the content it was built
+                    # from, so every pending displaced file -- each one
+                    # superseded by what just landed -- is safe to drop.
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass  # commit landed; a leftover dotfile is harmless
+                    tmp = None
+                    for spare in pending:
+                        try:
+                            os.unlink(spare)
+                        except OSError:
+                            pass
+                    pending = []
+                    committed = True
                     break
-                # The engine saved and its newer file is intact in our
-                # hands: re-apply the edit on top of it and commit again.
+                # Keep the displaced file until the merged commit lands:
+                # it is the only on-disk copy of the newer save. If the
+                # process dies or the staging fails mid-rebase, the
+                # settings survive in this dotfile instead of vanishing
+                # with our unlink; the engine ignores dotfiles here.
+                pending.append(tmp)
+                tmp = None
                 # Path currently holds our previous staged text, so that
                 # is what the next exchange must displace for the round
                 # to be clean. Each rebase consumes one save; saves are
@@ -296,6 +318,9 @@ def main(argv):
                 except OSError:
                     pass
         if stale or not committed:
+            # Deliberately leaving any pending displaced files behind:
+            # each holds a newer save whose merge did not land, and the
+            # engine's settings are worth more than a tidy directory.
             continue  # fresher content, or too hot: fresh read, retry
         try:
             landed_lines = read_lines(path)
@@ -312,7 +337,8 @@ def main(argv):
     # Another writer kept winning the file through every attempt. Its
     # content is what stands (nothing of ours is left to revert it), so
     # report the race and the value actually there instead of claiming
-    # the save.
+    # the save. Any pending displaced dotfiles are left in the directory
+    # on purpose: they preserve newer saves whose merge never landed.
     try:
         lines = read_lines(path)
     except OSError:

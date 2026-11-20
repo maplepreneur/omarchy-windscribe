@@ -566,12 +566,14 @@ practice:
   (`renameat2` with `RENAME_EXCHANGE`): the staged file and the conf
   file swap names atomically, and the displaced file tells the helper
   exactly what its edit replaced. If that is the engine's newer save,
-  it lands intact in the helper's hands and the edit is re-applied on
-  top of it — so a firewall or routing setting the engine saved in the
-  same instant always survives, never gets silently reverted, and
-  success means the installed file is provably the newest observed
-  content plus the one change. A save landing after the commit is
-  caught by the whole-file read-back and reconciled the same way.
+  it stays on disk — unlinked only after the edit re-applied on top of
+  it has been committed and verified — so a crash or a full disk
+  mid-merge cannot destroy it; even the give-up paths leave it rather
+  than drop a newer save. Either way a firewall or routing setting the
+  engine saved in the same instant always survives, never gets silently
+  reverted, and success means the installed file is provably the newest
+  observed content plus the one change. A save landing after the commit
+  is caught by the whole-file read-back and reconciled the same way.
   Where the exchange is unavailable, the helper falls back to a last
   identity check back to back with the rename — a microsecond gap, no
   wider than the window the engine's own writer accepts on every save —

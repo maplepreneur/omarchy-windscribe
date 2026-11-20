@@ -36,16 +36,17 @@ section:
   moment of the edit, changes one line (every other byte comes back as
   found), and writes atomically. An overlapping engine write cannot be
   lost unseen: where Linux allows it the commit is an atomic
-  `renameat2(RENAME_EXCHANGE)` swap, and the displaced file — read
-  before anything is discarded — either proves no writer interleaved or
-  hands the engine's newer save back intact for the edit to be re-applied
-  on top of; a save landing after the commit is caught by the whole-file
-  read-back and reconciled the same way. Where the exchange is
-  unavailable the helper falls back to a last identity check back to
-  back with the rename, with a documented microsecond gap. They never
-  happen on a timer, never while a CLI action is running, and the app
-  list is encoded with Qt's own string-list rules so a path with a comma
-  stays one entry.
+  `renameat2(RENAME_EXCHANGE)` swap, and the displaced file — kept on
+  disk until any merge built on it has been committed and verified, so
+  a crash or full disk mid-merge cannot destroy it — either proves no
+  writer interleaved or hands the engine's newer save back for the edit
+  to be re-applied on top of; a save landing after the commit is caught
+  by the whole-file read-back and reconciled the same way. Where the
+  exchange is unavailable the helper falls back to a last identity
+  check back to back with the rename, with a documented microsecond
+  gap. They never happen on a timer, never while a CLI action is
+  running, and the app list is encoded with Qt's own string-list rules
+  so a path with a comma stays one entry.
 - It never asks for root, and it never executes downloaded content.
 
 If you can read QML, the whole widget is a handful of small files; the
