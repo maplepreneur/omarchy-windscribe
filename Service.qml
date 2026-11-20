@@ -99,13 +99,14 @@ Item {
   // split tunneling, LAN traffic or the always-on firewall mode, so those
   // keys are edited here, but never from a cached copy of the file: every
   // save goes through the bundled confedit.py, which reads the file fresh
-  // at the moment of the edit, changes exactly one key's line, writes
-  // atomically, and checks the file's identity around the read, before
-  // the rename, and the whole file byte for byte after the write — an
-  // overlapping engine save is reconciled by re-applying the edit on top
-  // of the freshest content, never silently reverted, and the key is read
-  // back so the rows can confirm what the engine actually has, never what
-  // we asked for. The FileView below only reads and watches.
+  // at the moment of the edit, changes exactly one key's line, stages
+  // the write aside (temp file, fsync, permissions) and only then checks
+  // the file's identity around the read, back to back with the rename —
+  // no I/O in that gap — and after the rename compares the whole file
+  // byte for byte. An overlapping engine save is reconciled by re-applying
+  // the edit on top of the freshest content, never silently reverted, and
+  // the key is read back so the rows can confirm what the engine actually
+  // has, never what we asked for. The FileView below only reads and watches.
   readonly property string confPath:
     (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config"))
     + "/Windscribe/windscribe_cli.conf"

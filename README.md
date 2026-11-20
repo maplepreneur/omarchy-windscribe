@@ -563,11 +563,13 @@ practice:
 - The helper reads the file from disk at the moment of the edit, so a
   newer change the engine just saved can't be reverted by a stale copy.
   An overlapping write is caught, not clobbered: the file's identity is
-  checked around the read and before the rename, the whole file is
-  re-read and compared after it, and on any sign of a race the helper
-  re-reads the freshest content and re-applies its one-line edit on top —
-  so a firewall or routing setting the engine saved in the same instant
-  always survives, never gets silently reverted.
+  checked around the read, the write is staged aside (temp file, fsync,
+  permissions) before the last identity check so that check and the
+  rename sit back to back with no I/O between them, and the whole file
+  is re-read and compared after the rename. On any sign of a race the
+  helper re-reads the freshest content and re-applies its one-line edit
+  on top — so a firewall or routing setting the engine saved in the same
+  instant always survives, never gets silently reverted.
 - The edit is surgical and per-setting: exactly one `Key=value` line
   changes, and every other byte of the file — section order, unknown
   keys, spacing — comes back exactly as found. A diff before and after a

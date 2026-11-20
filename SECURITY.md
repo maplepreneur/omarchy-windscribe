@@ -35,8 +35,10 @@ section:
   one bundled helper (confedit.py) that reads the file fresh at the
   moment of the edit, changes one line (every other byte comes back as
   found), and writes atomically. An overlapping engine write is detected
-  — the file's identity is checked around the read and before the
-  rename, and the whole file is compared after it — and reconciled by
+  — the file's identity is checked around the read, the write is staged
+  aside (temp file, fsync, permissions) before the last identity check so
+  that check and the rename sit back to back with no I/O between them,
+  and the whole file is compared after the rename — and reconciled by
   re-applying the edit on top of the freshest content, so another
   setting's save is never silently reverted; a race that won't settle is
   reported, with the on-disk value read back, rather than claimed. They

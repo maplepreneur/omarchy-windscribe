@@ -3,9 +3,14 @@
 
 The node suite (tests/model-test.mjs) covers the helper end to end; this
 file proves the coordination property the helper exists for: a write
-from the Windscribe engine overlapping the helper's own read-modify-write
-window is reconciled on top of the freshest content, never silently
-reverted — and a writer that never settles is reported, not clobbered.
+from the Windscribe engine overlapping the helper's own
+read-modify-write window — during the read, while the write is staged,
+in the instant after the rename, or continuously — is reconciled on top
+of the freshest content, never silently reverted. The staging scenario
+fails against a helper whose last identity check precedes the fsync:
+the rename then overwrites the engine's file and the read-back, which
+verifies what replaced the file rather than what the file was, reports
+success while the engine's setting is lost.
 
 Each scenario patches a module-level function to stand in for the engine
 saving the file at the worst possible moment, then restores it. Run:
@@ -87,7 +92,6 @@ def patch_once(module, name, side_effect):
 def restore(module, name, original):
     setattr(module, name, original)
 
-
 print("confedit.py: sanity, one setting, one write")
 tmp = tempfile.mkdtemp(prefix="ws-confedit-")
 try:
@@ -141,14 +145,39 @@ try:
     # The engine saves in the instant after the helper's rename: the
     # helper's snapshot is on disk, then the engine's file replaces it
     # wholesale, taking the helper's edit down with it.
-    saved = patch_once(confedit, "atomic_write", lambda: engine_save(path, engine_text))
+    saved = patch_once(os, "replace", lambda: engine_save(path, engine_text))
     try:
         result = run(path, "FirewallMode", "Always On")
     finally:
-        restore(confedit, "atomic_write", saved)
+        restore(os, "replace", saved)
     eq("edit re-applied on top of the engine's file", result, 0)
     final = read(path)
     ok("engine's newer setting survived", "DNSManager=custom" in final)
+    ok("own key written", "FirewallMode=Always On" in final)
+    ok("everything else byte-exact",
+       final == engine_text.replace("FirewallMode=Auto", "FirewallMode=Always On"))
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: an engine save while the write is staged is caught before the rename")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    path = make_conf(tmp)
+    engine_text = read(path).replace("Autoconnect=false", "Autoconnect=true")
+    # The engine saves while the helper's write is being staged (the
+    # fsync window). The last identity check must come AFTER the staging,
+    # back to back with the rename, or the rename overwrites the engine's
+    # file and the read-back — which verifies what replaced the file, not
+    # what the file was — still finds the helper's text and reports
+    # success while the engine's setting is lost.
+    saved = patch_once(os, "fsync", lambda: engine_save(path, engine_text))
+    try:
+        result = run(path, "FirewallMode", "Always On")
+    finally:
+        restore(os, "fsync", saved)
+    eq("edit lands on top of the engine's file", result, 0)
+    final = read(path)
+    ok("engine's newer setting survived", "Autoconnect=true" in final)
     ok("own key written", "FirewallMode=Always On" in final)
     ok("everything else byte-exact",
        final == engine_text.replace("FirewallMode=Auto", "FirewallMode=Always On"))

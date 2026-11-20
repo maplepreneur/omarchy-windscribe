@@ -15,16 +15,19 @@ never saw. This helper closes both gaps as far as a non-Qt process can:
     section order, unknown keys, spacing, the trailing-newline habit -- is
     handed back exactly as found (no extra newline is ever added)
   * the file is never created: a missing file, section or key is refused
-  * the write is atomic: a temp file in the same directory, fsynced, then
-    renamed over the original with the original's permissions kept
   * an overlapping write is detected, never silently reverted: the file's
-    identity (inode, mtime, size) is checked around the read and again
-    immediately before the rename, and after the write the WHOLE file is
-    re-read and compared byte for byte with what was meant to land. Any
-    sign that another writer (the engine, most likely) touched the file in
-    that window makes the helper drop its snapshot, re-read the freshest
-    content, and re-apply its one-line edit on top of it, so the other
-    writer's setting -- a firewall or routing key, say -- always survives
+    identity (inode, mtime, size) is checked around the read, and the
+    write is STAGED aside (temp file, fsync, permissions) BEFORE that
+    last identity check, so the check and the rename sit back to back
+    with no I/O between them — an engine save would have to land its
+    whole rename inside that syscall pair, a gap narrower than the
+    prepare-then-rename window the engine's own QSettings writer accepts
+    on every save. After the rename the WHOLE file is re-read and
+    compared byte for byte with what was meant to land, and any race
+    outside that gap makes the helper drop its snapshot, re-read the
+    freshest content, and re-apply its one-line edit on top of it, so
+    the other writer's setting -- a firewall or routing key, say --
+    always survives
   * after the coordinated write, the key is read back from disk and
     compared with what was asked for; the value actually on disk is
     printed to stdout either way, so the caller can confirm what the
@@ -113,8 +116,14 @@ def read_lines(path):
         return handle.read().split("\n")
 
 
-def atomic_write(path, text, mode):
-    """Write aside in the same directory, fsync, then rename over `path`."""
+def stage_write(path, text, mode):
+    """Stage `text` aside in the same directory: temp file, fsynced,
+    permissions kept. Everything slow happens HERE, before the caller's
+    last identity check, so the check-to-rename gap carries no I/O — a
+    writer who lands during the staging is seen by that check, not
+    clobbered by a rename that still has the fsync ahead of it. Returns
+    the temp path; the caller renames it after its final check.
+    """
     directory = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(prefix=".confedit-", dir=directory)
     try:
@@ -124,13 +133,13 @@ def atomic_write(path, text, mode):
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp, mode)
-        os.replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+    return tmp
 
 
 def identity(st):
@@ -168,17 +177,31 @@ def main(argv):
             return EXIT_MISSING
         lines[at] = rewrite_line(lines[at], key, value)
         text = "\n".join(lines)
+        # Stage the write FIRST: if the fsync sat between the last
+        # identity check and the rename, a save landing in that gap
+        # would be overwritten and the read-back below -- which verifies
+        # what replaced the file, not what the file was -- would still
+        # find our text and report success while the save was lost.
+        tmp = None
         try:
+            tmp = stage_write(path, text, before.st_mode & 0o7777)
             if identity(os.stat(path)) != identity(before):
                 continue  # fresher content exists: re-read, don't clobber
-            atomic_write(path, text, before.st_mode & 0o7777)
+            os.replace(tmp, path)
+            tmp = None
             landed_lines = read_lines(path)
         except FileNotFoundError:
             return EXIT_MISSING
         except OSError:
             return EXIT_IOERR
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         # Verify the whole file, not just our key: if a writer landed
-        # during the rename, our snapshot reverted its change, and the
+        # after the rename, our snapshot reverted its change, and the
         # fix is to re-apply ours on top of what is there now.
         if "\n".join(landed_lines) != text:
             continue
