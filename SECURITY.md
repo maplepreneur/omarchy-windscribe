@@ -34,17 +34,18 @@ section:
   you flip a switch the CLI has no command for. Those writes go through
   one bundled helper (confedit.py) that reads the file fresh at the
   moment of the edit, changes one line (every other byte comes back as
-  found), and writes atomically. An overlapping engine write is detected
-  — the file's identity is checked around the read, the write is staged
-  aside (temp file, fsync, permissions) before the last identity check so
-  that check and the rename sit back to back with no I/O between them,
-  and the whole file is compared after the rename — and reconciled by
-  re-applying the edit on top of the freshest content, so another
-  setting's save is never silently reverted; a race that won't settle is
-  reported, with the on-disk value read back, rather than claimed. They
-  never happen on a timer, never while a CLI action is running, and the
-  app list is encoded with Qt's own string-list rules so a path with a
-  comma stays one entry.
+  found), and writes atomically. An overlapping engine write cannot be
+  lost unseen: where Linux allows it the commit is an atomic
+  `renameat2(RENAME_EXCHANGE)` swap, and the displaced file — read
+  before anything is discarded — either proves no writer interleaved or
+  hands the engine's newer save back intact for the edit to be re-applied
+  on top of; a save landing after the commit is caught by the whole-file
+  read-back and reconciled the same way. Where the exchange is
+  unavailable the helper falls back to a last identity check back to
+  back with the rename, with a documented microsecond gap. They never
+  happen on a timer, never while a CLI action is running, and the app
+  list is encoded with Qt's own string-list rules so a path with a comma
+  stays one entry.
 - It never asks for root, and it never executes downloaded content.
 
 If you can read QML, the whole widget is a handful of small files; the

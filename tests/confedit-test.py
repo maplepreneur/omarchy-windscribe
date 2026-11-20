@@ -92,6 +92,27 @@ def patch_once(module, name, side_effect):
 def restore(module, name, original):
     setattr(module, name, original)
 
+
+def patch_exchange(when, side_effect):
+    """Wrap confedit.exchange_paths so side_effect runs before or after
+    the first exchange call only. Returns the original; restore with
+    restore(confedit, "exchange_paths", original)."""
+    original = confedit.exchange_paths
+    state = {"done": False}
+
+    def wrapper(old, new):
+        if when == "pre" and not state["done"]:
+            state["done"] = True
+            side_effect()
+        result = original(old, new)
+        if when == "post" and not state["done"]:
+            state["done"] = True
+            side_effect()
+        return result
+
+    confedit.exchange_paths = wrapper
+    return original
+
 print("confedit.py: sanity, one setting, one write")
 tmp = tempfile.mkdtemp(prefix="ws-confedit-")
 try:
@@ -137,25 +158,78 @@ try:
 finally:
     shutil.rmtree(tmp)
 
-print("confedit.py: an engine save right after the rename is reconciled, not lost")
+print("confedit.py: an engine save completing just before the commit is merged, not lost")
 tmp = tempfile.mkdtemp(prefix="ws-confedit-")
 try:
-    path = make_conf(tmp)
-    engine_text = read(path).replace("DNSManager=Auto", "DNSManager=custom")
-    # The engine saves in the instant after the helper's rename: the
-    # helper's snapshot is on disk, then the engine's file replaces it
-    # wholesale, taking the helper's edit down with it.
-    saved = patch_once(os, "replace", lambda: engine_save(path, engine_text))
-    try:
-        result = run(path, "FirewallMode", "Always On")
-    finally:
-        restore(os, "replace", saved)
-    eq("edit re-applied on top of the engine's file", result, 0)
-    final = read(path)
-    ok("engine's newer setting survived", "DNSManager=custom" in final)
-    ok("own key written", "FirewallMode=Always On" in final)
-    ok("everything else byte-exact",
-       final == engine_text.replace("FirewallMode=Auto", "FirewallMode=Always On"))
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        engine_text = read(path).replace("Autoconnect=false", "Autoconnect=true")
+        # The engine's rename completes in the instant before the
+        # helper's commit -- the interleaving no identity check can see.
+        # The atomic exchange must displace the engine's newer file into
+        # the helper's hands and re-apply the edit on top of it.
+        saved = patch_exchange("pre", lambda: engine_save(path, engine_text))
+        try:
+            result = run(path, "FirewallMode", "Always On")
+        finally:
+            restore(confedit, "exchange_paths", saved)
+        eq("edit re-applied on top of the engine's file", result, 0)
+        final = read(path)
+        ok("engine's newer setting survived", "Autoconnect=true" in final)
+        ok("own key written", "FirewallMode=Always On" in final)
+        ok("everything else byte-exact",
+           final == engine_text.replace("FirewallMode=Auto", "FirewallMode=Always On"))
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: an engine save right after the commit is reconciled, not lost")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        engine_text = read(path).replace("DNSManager=Auto", "DNSManager=custom")
+        # The engine saves in the instant after the commit: the whole-file
+        # read-back must see it and re-apply on top, not claim our edit.
+        saved = patch_exchange("post", lambda: engine_save(path, engine_text))
+        try:
+            result = run(path, "FirewallMode", "Always On")
+        finally:
+            restore(confedit, "exchange_paths", saved)
+        eq("edit re-applied on top of the engine's file", result, 0)
+        final = read(path)
+        ok("engine's newer setting survived", "DNSManager=custom" in final)
+        ok("own key written", "FirewallMode=Always On" in final)
+        ok("everything else byte-exact",
+           final == engine_text.replace("FirewallMode=Auto", "FirewallMode=Always On"))
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: an unavailable exchange demotes to the fallback, still commits")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        original = confedit.exchange_paths
+        calls = {"n": 0}
+
+        def unsupported(old, new):
+            calls["n"] += 1
+            raise OSError(22, "Invalid argument", old)  # EINVAL, as an old fs gives
+
+        confedit.exchange_paths = unsupported
+        try:
+            result = run(path, "FirewallMode", "Always On")
+        finally:
+            restore(confedit, "exchange_paths", original)
+        eq("fallback commit succeeds", result, 0)
+        eq("fallback used after demotion", calls["n"], 1)
+        ok("own key written", "FirewallMode=Always On" in read(path))
 finally:
     shutil.rmtree(tmp)
 
