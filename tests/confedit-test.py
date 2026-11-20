@@ -6,11 +6,10 @@ file proves the coordination property the helper exists for: a write
 from the Windscribe engine overlapping the helper's own
 read-modify-write window — during the read, while the write is staged,
 in the instant after the rename, or continuously — is reconciled on top
-of the freshest content, never silently reverted. The staging scenario
-fails against a helper whose last identity check precedes the fsync:
-the rename then overwrites the engine's file and the read-back, which
-verifies what replaced the file rather than what the file was, reports
-success while the engine's setting is lost.
+of the freshest content, never silently reverted. A later retry must not
+report success with an older preferences file while a newer save remains
+in a side file, and a displaced copy must not be deleted if the read of
+it fails.
 
 Each scenario patches a module-level function to stand in for the engine
 saving the file at the worst possible moment, then restores it. Run:
@@ -245,6 +244,8 @@ try:
                      for name in os.listdir(tmp)]
         ok("newer save still on disk after the failure",
            any("Autoconnect=true" in text for text in survivors))
+        ok("newer save is the active file, not only a side file",
+           "Autoconnect=true" in read(path), read(path))
 finally:
     shutil.rmtree(tmp)
 
@@ -257,8 +258,10 @@ try:
         path = make_conf(tmp)
         original = read(path)
         # A pathological engine that saves again before every commit,
-        # forever: the helper must give up (exit 5) and leave the newest
-        # save recoverable, never delete it in frustration.
+        # forever: the helper must not claim success, and must not delete
+        # the newest save. A later retry, once the engine stops, must not
+        # report success with an older preferences file while that newest
+        # save remains in a side file Windscribe does not reload.
         fires = {"n": 0}
         real = confedit.exchange_paths
         def storm(old, new):
@@ -271,12 +274,187 @@ try:
             result = run(path, "FirewallMode", "Always On")
         finally:
             restore(confedit, "exchange_paths", real)
-        eq("unbounded race reported, not claimed", result, 5)
-        survivors = [read(os.path.join(tmp, name))
-                     for name in os.listdir(tmp)]
+        ok("unbounded race not claimed as success", result != 0, "exit " + str(result))
         newest = "DNSManager=Storm%d" % (fires["n"] - 1)
+        survivors = [read(os.path.join(tmp, name))
+                     for name in os.listdir(tmp)
+                     if not name.startswith(".confedit-journal")]
         ok("newest save still on disk after giving up",
            any(newest in text for text in survivors))
+        if result == 0:
+            ok("success would have to be the newest active file",
+               newest in read(path))
+        else:
+            retry = run(path, "FirewallMode", "Always On")
+            eq("later retry confirms the edit", retry, 0)
+            final = read(path)
+            ok("later retry did not keep an older active file",
+               newest in final, "active is " + final)
+            ok("own key written on top of the newest save",
+               "FirewallMode=Always On" in final)
+            stale_side = []
+            for name in os.listdir(tmp):
+                if name == "windscribe_cli.conf":
+                    continue
+                text = read(os.path.join(tmp, name))
+                if "DNSManager=Storm" in text and newest not in text:
+                    # An older side file is harmless. A newer one is not.
+                    pass
+                if newest not in text:
+                    continue
+                if name != "windscribe_cli.conf" and newest in text and newest not in final:
+                    stale_side.append(name)
+            ok("newest save is not stranded in a side file",
+               newest in final and not stale_side)
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: a later retry adopts a journaled newer save before succeeding")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        original = read(path)
+        # The state left when merge attempts exhaust: the active file is
+        # an older install of ours, and a side file holds the engine's
+        # newest save. A later retry must not report success until that
+        # save is the active file.
+        older = original.replace("FirewallMode=Auto", "FirewallMode=Always On")
+        newest = original.replace("Autoconnect=false", "Autoconnect=true").replace(
+            "DNSManager=Auto", "DNSManager=Newest")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(older)
+        hold = os.path.join(tmp, ".confedit-held")
+        with open(hold, "w", encoding="utf-8") as handle:
+            handle.write(newest)
+        confedit._add_record(path, hold, confedit.text_sha(older))
+        confedit._set_displaced(path, hold, confedit.text_sha(newest))
+        result = run(path, "SplitTunnelingEnabled", "true")
+        eq("later retry confirms on top of the journaled save", result, 0)
+        final = read(path)
+        ok("newest engine setting is active", "DNSManager=Newest" in final, final)
+        ok("newest autoconnect is active", "Autoconnect=true" in final)
+        ok("retried key written", "SplitTunnelingEnabled=true" in final)
+        ok("no newer save left only in a side file",
+           not any(name.startswith(".confedit-") and name != ".confedit.lock"
+                   for name in os.listdir(tmp)))
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: a failed read of the displaced file does not delete it")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        engine_text = read(path).replace("Autoconnect=false", "Autoconnect=true")
+        # The engine saves in the instant before the commit, so the swap
+        # displaces the newer preferences. The first read of that displaced
+        # file fails. The helper must not unlink it -- the previous code
+        # deleted it in the cleanup that runs on any exception.
+        real_read = confedit.read_lines
+        real_exchange = confedit.exchange_paths
+        state = {"swapped": False, "failed": False}
+
+        def exchange_once(old, new):
+            if not state["swapped"]:
+                state["swapped"] = True
+                engine_save(path, engine_text)
+            return real_exchange(old, new)
+
+        def read_fail_displaced(target):
+            lines = real_read(target)
+            if (not state["failed"] and target != path
+                    and "Autoconnect=true" in "\n".join(lines)):
+                state["failed"] = True
+                raise OSError(5, "Input/output error")
+            return lines
+
+        confedit.exchange_paths = exchange_once
+        confedit.read_lines = read_fail_displaced
+        try:
+            result = run(path, "FirewallMode", "Always On")
+        finally:
+            restore(confedit, "exchange_paths", real_exchange)
+            restore(confedit, "read_lines", real_read)
+        ok("failed displaced read did not report success without the save",
+           result != 0 or "Autoconnect=true" in read(path),
+           "exit " + str(result))
+        present = []
+        for name in os.listdir(tmp):
+            text = read(os.path.join(tmp, name))
+            if "Autoconnect=true" in text:
+                present.append(name)
+        ok("displaced save was not deleted when its read failed",
+           bool(present), "dir " + str(os.listdir(tmp)))
+        if result != 0:
+            retry = run(path, "FirewallMode", "Always On")
+            eq("later retry after a failed displaced read", retry, 0)
+            final = read(path)
+            ok("newer save is the active file after the retry",
+               "Autoconnect=true" in final, final)
+            ok("own key written on top of the restored save",
+               "FirewallMode=Always On" in final)
+        else:
+            ok("success left the newer save active",
+               "Autoconnect=true" in read(path))
+finally:
+    shutil.rmtree(tmp)
+
+print("confedit.py: a failed read still keeps the displaced file if restore fails")
+tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+try:
+    if confedit.exchange_paths is None:
+        print("skip -- no renameat2 on this platform")
+    else:
+        path = make_conf(tmp)
+        engine_text = read(path).replace("Autoconnect=false", "Autoconnect=true")
+        # Forward swap displaces the newer save, the read of it fails, and
+        # the swap that would put it back also fails. The previous cleanup
+        # unlinked the displaced file on that exception. It must survive,
+        # and a later retry must publish it to the active file before
+        # reporting success.
+        real_read = confedit.read_lines
+        real_exchange = confedit.exchange_paths
+        state = {"n": 0, "failed": False}
+
+        def exchange_then_fail(old, new):
+            state["n"] += 1
+            if state["n"] == 1:
+                engine_save(path, engine_text)
+                return real_exchange(old, new)
+            raise OSError(5, "Input/output error")
+
+        def read_fail_displaced(target):
+            lines = real_read(target)
+            if (not state["failed"] and target != path
+                    and "Autoconnect=true" in "\n".join(lines)):
+                state["failed"] = True
+                raise OSError(5, "Input/output error")
+            return lines
+
+        confedit.exchange_paths = exchange_then_fail
+        confedit.read_lines = read_fail_displaced
+        try:
+            result = run(path, "FirewallMode", "Always On")
+        finally:
+            restore(confedit, "exchange_paths", real_exchange)
+            restore(confedit, "read_lines", real_read)
+        eq("unreadable displaced save is an I/O error, not success", result, 6)
+        held = [name for name in os.listdir(tmp)
+                if "Autoconnect=true" in read(os.path.join(tmp, name))]
+        ok("displaced copy survived the failed read and the failed restore",
+           bool(held), "dir " + str(os.listdir(tmp)))
+        retry = run(path, "FirewallMode", "Always On")
+        eq("later retry publishes the preserved save", retry, 0)
+        final = read(path)
+        ok("preserved save is active after the retry",
+           "Autoconnect=true" in final, final)
+        ok("own key written on the preserved save",
+           "FirewallMode=Always On" in final)
 finally:
     shutil.rmtree(tmp)
 
