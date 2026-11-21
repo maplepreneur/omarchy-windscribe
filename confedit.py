@@ -369,11 +369,15 @@ class Run:
         self.exchange = exchange
         self._pins = []
 
-    def stat(self, path):
-        """Open `path` and keep it open; return its fstat."""
+    def open_stat(self, path):
+        """Open `path` and keep it open; return `(fd, fstat)`."""
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
         self._pins.append(fd)
-        return os.fstat(fd)
+        return fd, os.fstat(fd)
+
+    def stat(self, path):
+        """Open `path` and keep it open; return its fstat."""
+        return self.open_stat(path)[1]
 
     def ident(self, path):
         return identity(self.stat(path))
@@ -448,59 +452,113 @@ def publish(run, hold, expect):
     return EXIT_RACED
 
 
+def _read_fd(fd):
+    """Read all bytes from a pinned descriptor without moving its offset."""
+    chunks = []
+    offset = 0
+    while True:
+        chunk = os.pread(fd, 65536, offset)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
+
+
 def _recover_legacy(run, records):
-    """Finish what a v1.0.6 journal left, as far as its own records allow.
+    """Finish what a v1.0.6 journal left, or refuse if ambiguous.
 
-    That format ordered snapshots by content hash. Its one unambiguous
-    case is kept: if the active file is still a file the old helper
-    installed (or was about to replace), nobody saved after it, so the
-    newest held snapshot that is not that file is newer and is published.
-    Any other side file is left on disk untouched, never deleted.
+    v1.0.6 ordered snapshots by content hash:
+      ours <TAB> displaced <TAB> phase <TAB> expect <TAB> file
+    That format can leave an active file the journal cannot identify (for
+    example, after an overlapping save during an earlier recovery). Holds
+    that are provably obsolete (our own staged edit, already identical to
+    active, or the `expect` file a completed publish replaced) are removed.
+    A single remaining hold is published via the identity-based `publish()`
+    only when the journal proves the active file is an older version the
+    old helper installed or was about to replace. In any ambiguous case --
+    an unidentified active file or multiple unresolved holds -- the helper
+    leaves the held file(s) and the legacy journal untouched and exits 6,
+    so it never clears the journal or claims success over older settings.
     """
-    def sha(text):
-        return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
-
     parsed = []
     for line in records:
         parts = line.split("\t")
-        if len(parts) != 5:
+        if (len(parts) != 5 or not parts[0]
+                or parts[2] not in ("swap", "publish") or not parts[4]):
             return EXIT_IOERR
-        parsed.append({"ours": parts[0], "expect": parts[3], "file": parts[4]})
+        hold = parts[4]
+        hold_dir = os.path.realpath(os.path.dirname(hold) or ".")
+        if hold_dir != run.conf_dir or os.path.realpath(hold) == run.conf:
+            return EXIT_IOERR
+        parsed.append({
+            "ours": parts[0],
+            "displaced": None if parts[1] == "-" else parts[1],
+            "phase": parts[2],
+            "expect": None if parts[3] == "-" else parts[3],
+            "file": hold,
+        })
     try:
-        active_stat = run.stat(run.conf)
-        active_sha = sha(read_text(run.conf))
+        active_fd, active_stat = run.open_stat(run.conf)
+        active_sha = hashlib.sha256(_read_fd(active_fd)).hexdigest()
     except FileNotFoundError:
         return EXIT_MISSING
     except OSError:
         return EXIT_IOERR
-    candidate = None
-    if any(active_sha in (rec["ours"], rec["expect"]) for rec in parsed):
-        for rec in parsed:
-            if os.path.dirname(rec["file"]) != run.conf_dir:
-                continue
-            try:
-                held_sha = sha(read_text(rec["file"]))
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return EXIT_IOERR
-            if held_sha not in (rec["ours"], active_sha):
-                candidate = rec["file"]
-    if candidate is not None:
-        status = publish(run, candidate, identity(active_stat))
-        if status != "ok":
-            return status
+
+    unresolved = []
     for rec in parsed:
         try:
-            if sha(read_text(rec["file"])) == rec["ours"]:
-                _unlink_quiet(rec["file"])  # the old helper's own staged text
+            hold_fd, _hold_stat = run.open_stat(rec["file"])
+            held_sha = hashlib.sha256(_read_fd(hold_fd)).hexdigest()
+        except FileNotFoundError:
+            continue
         except OSError:
-            pass
-    try:
-        save_journal(run.conf, None)
-    except OSError:
+            return EXIT_IOERR
+        completed_publish = (
+            rec["phase"] == "publish"
+            and rec["displaced"] is not None
+            and rec["expect"] is not None
+            and active_sha == rec["displaced"]
+            and held_sha == rec["expect"]
+        )
+        if held_sha == rec["ours"] or held_sha == active_sha or completed_publish:
+            try:
+                os.unlink(rec["file"])
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return EXIT_IOERR
+            continue
+        unresolved.append((rec, held_sha))
+
+    if not unresolved:
+        try:
+            save_journal(run.conf, None)
+        except OSError:
+            return EXIT_IOERR
+        return "ok"
+
+    if len(unresolved) != 1:
         return EXIT_IOERR
-    return "ok"
+
+    rec, held_sha = unresolved[0]
+    active_is_ours = active_sha == rec["ours"]
+    active_is_expect = (
+        rec["phase"] == "publish"
+        and rec["expect"] is not None
+        and active_sha == rec["expect"]
+    )
+    active_is_displaced = (
+        rec["phase"] == "publish"
+        and rec["displaced"] is not None
+        and active_sha == rec["displaced"]
+        and held_sha != rec["displaced"]
+    )
+    if not (active_is_ours or active_is_expect or active_is_displaced):
+        return EXIT_IOERR
+
+    return publish(run, rec["file"], identity(active_stat))
 
 
 def recover(run):

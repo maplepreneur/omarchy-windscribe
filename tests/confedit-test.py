@@ -971,6 +971,111 @@ if confedit.exchange_paths is not None:
     finally:
         shutil.rmtree(tmp)
 
+    print("confedit.py: an ambiguous v1.0.6 journal refuses instead of claiming success on older prefs")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
+        path = make_conf(tmp)
+        original = read(path)
+        import hashlib
+        sha = lambda t: hashlib.sha256(t.encode()).hexdigest()
+        ours = edited(original)
+        older_active = original.replace("DNSManager=Auto", "DNSManager=OlderActive")
+        newer_held = original.replace("DNSManager=Auto", "DNSManager=NewerHeld")
+        engine_save(path, older_active)
+        hold = os.path.join(tmp, ".confedit-legacyambig")
+        with open(hold, "w") as handle:
+            handle.write(newer_held)
+        with open(os.path.join(tmp, ".confedit-journal"), "w") as handle:
+            handle.write("\t".join((sha(ours), "-", "swap", "-", hold)) + "\n")
+        eq("ambiguous legacy state refused as I/O error",
+           run(path, "SplitTunnelingEnabled", "true"), 6)
+        ok("legacy journal preserved", journal_open(path))
+        ok("newer held file preserved", os.path.exists(hold) and read(hold) == newer_held)
+        eq("older active file not edited", read(path), older_active)
+        eq("subsequent retry still refuses rather than succeeding on older prefs",
+           run(path, "SplitTunnelingEnabled", "true"), 6)
+        ok("journal still preserved on retry", journal_open(path))
+        ok("held file still preserved on retry", os.path.exists(hold))
+    finally:
+        shutil.rmtree(tmp)
+
+    print("confedit.py: a v1.0.6 publish journal with a captured newer save publishes it")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
+        path = make_conf(tmp)
+        original = read(path)
+        import hashlib
+        sha = lambda t: hashlib.sha256(t.encode()).hexdigest()
+        ours = edited(original)
+        mid = original.replace("DNSManager=Auto", "DNSManager=Mid")
+        newest = original.replace("DNSManager=Auto", "DNSManager=Captured")
+        engine_save(path, mid)
+        hold = os.path.join(tmp, ".confedit-legacypub")
+        with open(hold, "w") as handle:
+            handle.write(newest)
+        with open(os.path.join(tmp, ".confedit-journal"), "w") as handle:
+            handle.write("\t".join((sha(ours), sha(mid), "publish", sha(ours), hold)) + "\n")
+        eq("captured newer save published and edited",
+           run(path, "SplitTunnelingEnabled", "true"), 0)
+        final = read(path)
+        ok("captured newer save is active", "DNSManager=Captured" in final, final)
+        ok("requested edit applied on top", "SplitTunnelingEnabled=true" in final)
+        eq("no litter left", litter(tmp), [])
+    finally:
+        shutil.rmtree(tmp)
+
+    print("confedit.py: a v1.0.6 completed publish journal drops the obsolete expect hold")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
+        path = make_conf(tmp)
+        original = read(path)
+        import hashlib
+        sha = lambda t: hashlib.sha256(t.encode()).hexdigest()
+        ours = edited(original)
+        prev = original.replace("DNSManager=Auto", "DNSManager=Prev")
+        newest = original.replace("DNSManager=Auto", "DNSManager=Published")
+        engine_save(path, newest)
+        hold = os.path.join(tmp, ".confedit-legacydone")
+        with open(hold, "w") as handle:
+            handle.write(prev)
+        with open(os.path.join(tmp, ".confedit-journal"), "w") as handle:
+            handle.write("\t".join((sha(ours), sha(newest), "publish", sha(prev), hold)) + "\n")
+        eq("completed legacy publish settles cleanly",
+           run(path, "SplitTunnelingEnabled", "true"), 0)
+        final = read(path)
+        ok("published save kept active", "DNSManager=Published" in final, final)
+        ok("requested edit applied", "SplitTunnelingEnabled=true" in final)
+        eq("no litter left", litter(tmp), [])
+    finally:
+        shutil.rmtree(tmp)
+
+    print("confedit.py: a v1.0.6 journal with multiple unresolved holds refuses")
+    tmp = tempfile.mkdtemp(prefix="ws-confedit-")
+    try:
+        path = make_conf(tmp)
+        original = read(path)
+        import hashlib
+        sha = lambda t: hashlib.sha256(t.encode()).hexdigest()
+        ours = edited(original)
+        s1 = original.replace("DNSManager=Auto", "DNSManager=Hold1")
+        s2 = original.replace("DNSManager=Auto", "DNSManager=Hold2")
+        engine_save(path, ours)
+        h1 = os.path.join(tmp, ".confedit-h1")
+        h2 = os.path.join(tmp, ".confedit-h2")
+        with open(h1, "w") as handle:
+            handle.write(s1)
+        with open(h2, "w") as handle:
+            handle.write(s2)
+        with open(os.path.join(tmp, ".confedit-journal"), "w") as handle:
+            handle.write("\t".join((sha(ours), sha(s1), "swap", "-", h1)) + "\n")
+            handle.write("\t".join((sha(ours), sha(s2), "swap", "-", h2)) + "\n")
+        eq("multiple unresolved legacy holds refused",
+           run(path, "SplitTunnelingEnabled", "true"), 6)
+        ok("journal preserved", journal_open(path))
+        ok("both holds preserved", os.path.exists(h1) and os.path.exists(h2))
+    finally:
+        shutil.rmtree(tmp)
+
 print("")
 print(str(pass_count) + " passed, " + str(fail_count) + " failed")
 sys.exit(0 if fail_count == 0 else 1)
